@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- fixed-holiday-1778028748861 force-deploy-1784774370229 -->
+<!-- fixed-holiday-1778028748861 force-deploy-1785162066122 -->
 <html lang="ja">
 <head>
   <meta charset="UTF-8" />
@@ -17,7 +17,7 @@
     // 開きっぱなしのタブが旧コードのまま動き続けるのを防ぐ。画面復帰時と定期に自分自身を
     // no-store+クエリ付きで取得し、__APP_BUILD が変わっていれば「更新」バナーを表示する。
     // 本番デプロイ時は port_to_main.js が __APP_BUILD を自動更新する（手動更新不要）。
-    window.__APP_BUILD='build-1784774370229';
+    window.__APP_BUILD='build-1785162066122';
     (function(){
       var RUNNING=window.__APP_BUILD, shown=false, checking=false;
       function banner(){
@@ -94,7 +94,7 @@
 const { useState, useEffect, useLayoutEffect, useRef, useCallback, memo, useMemo } = React;
 
 // ★ バージョン管理：アップデートのたびにここだけ変更する
-const APP_VERSION = '1.66';
+const APP_VERSION = '1.68';
 
 
 
@@ -1558,19 +1558,127 @@ const inspPendSave = list=>{try{localStorage.setItem(INSP_PEND_KEY,JSON.stringif
 const inspPendAdd  = p=>{const l=inspPendLoad();l.push(p);inspPendSave(l);};
 const inspPendDrop = pid=>inspPendSave(inspPendLoad().filter(p=>p.pid!==pid));
 
-// ── 予約1件を「サーバー最新値」に足す純関数（再送用）──
-//   ★必ずサーバーから読んだ最新値を base に渡すこと。base のほかの日付・ほかの行には一切触らず、
-//     指定日に該当予約(同一人物)が無ければ末尾に足すだけ。他端末の予約を巻き添えで消さない。
+// ── 保存する予約1件を「渡されたベース」に適用して insp 全体を組み立てる純関数（第2層）──
 //   （blankInsp / recomputeInspApproval は後方で定義されるが、本関数は実行時にのみ呼ぶので順序問題なし。）
-const applyBookingToInspBase = (base, dk, row, limit)=>{
+//   ★base にサーバー最新値を渡すのが基本。ローカルstateを丸ごと書き戻すと、直近のポーリング
+//     以降に他端末が入れた予約（別の日付・同じ日の別の行）を巻き添えで消すため。
+//   p = {targetDk, origDk, isDateChange, dcPlaceIdx, modalIdx, row, limits, wasEditing, seq}
+//   戻り値 = {result, idxPlace, relocated, pendingNow}
+//     relocated … 配置先が他端末の予約で埋まっていたので空き行へ逃がした（bookingKeyも振り直し済み）
+//     pendingNow … 今回の保存で「承認待ち」に転じた（呼び出し側で1回だけ通知する）
+const buildInspSave = (base, p)=>{
   const data=(base&&typeof base==='object'&&!Array.isArray(base))?{...base}:{};
-  const rows=(data[dk]||[]).map(r=>r||blankInsp());
-  const cust=row.custId, name=row.name, no=row.no;
-  const already=rows.some(r=>r&&r.bookingStatus!=='cancelled'&&(cust?r.custId===cust:(r.name===name&&String(r.no||'')===String(no||''))));
-  if(already)return {data,changed:false};
-  rows.push({...row, seq:row.seq||Date.now(), bookingStatus:'confirmed'});
-  data[dk]=recomputeInspApproval(rows, (limit!=null)?limit:6);
-  return {data,changed:true};
+  const prevRows=(data[p.targetDk]||[]).map(r=>r||blankInsp());
+  let rows=[...prevRows];
+  const occupied=r=>!!(r&&r.name&&r.bookingStatus!=='cancelled');
+  let idxPlace=p.isDateChange?p.dcPlaceIdx:p.modalIdx;
+  let relocated=false;
+  // 新規予約または日付変更で配置先が埋まっているとき＝他端末が先にその行を使った（or 移動先が衝突）。
+  // 上書き消失だけは絶対に起こさないので空き行へ逃がす。既存予約の編集(wasEditing)はその行が
+  // 自分の予約なのでそのまま上書きする（従来どおりの挙動）。
+  if((!p.wasEditing||p.isDateChange)&&occupied(rows[idxPlace])){
+    const fb=rows.findIndex(r=>!occupied(r));
+    idxPlace=fb>=0?fb:rows.length;
+    relocated=true;
+  }
+  while(rows.length<=idxPlace)rows.push(blankInsp());
+  const prevRow=prevRows[idxPlace];
+  // 同一のアクティブ予約を編集している時だけ既存のseq・状態を引き継ぐ。
+  // 空き／キャンセル済みスロットへの新規予約は必ず新しいseqを付与（予約順の最後に並ぶ）。
+  const editingActive=!!(p.wasEditing&&!relocated&&occupied(prevRow));
+  const wasPending=editingActive&&!!prevRow.pendingApproval;
+  const dayLimit=p.limits[p.targetDk]??6;
+  const newRow={...p.row,seq:(editingActive&&prevRow.seq)?prevRow.seq:(p.seq||Date.now()),bookingStatus:'confirmed'};
+  if(p.isDateChange||relocated){
+    // 日付変更／行移動＝移動先で承認状態を再評価する。元の承認/承認待ちフラグは引き継がない。
+    delete newRow.approved;
+    delete newRow.pendingApproval;
+    if(p.isDateChange)newRow.seq=p.seq||Date.now();
+    // 行が新しい位置に移るため、代車紐付け用bookingKeyも新位置で振り直す
+    newRow.bookingKey=`insp-${p.targetDk}-${idxPlace}`;
+  }
+  rows[idxPlace]=newRow;
+  // 予約順(seq)で承認状態を再計算（既存の確定行は確定のまま＝編集で承認を再要求しない）
+  rows=recomputeInspApproval(rows,dayLimit);
+  const result={...data,[p.targetDk]:rows};
+  if(p.origDk&&p.origDk!==p.targetDk&&data[p.origDk]){
+    let oldRows=[...(data[p.origDk]||[])];
+    if(oldRows[p.modalIdx])oldRows[p.modalIdx]=blankInsp();
+    // 日付変更で空いた旧日の枠も再計算（空いた分だけ承認待ちを昇格）
+    oldRows=recomputeInspApproval(oldRows,p.limits[p.origDk]??6);
+    result[p.origDk]=oldRows;
+  }
+  return {result, idxPlace, relocated, pendingNow:!!(rows[idxPlace]&&rows[idxPlace].pendingApproval&&!wasPending)};
+};
+
+// ── 予約1件を特定する述語（削除・状態変更の対象判定）。位置(idx)ではなく本人性で照合する ──
+//   custId → seq（行ごとに一意）→ 氏名+no の順（handleDeleteModal の _delVerify と同じ規約）。
+//   これにより、サーバー最新値で行の並びがズレていても取り違えない。
+const _inspMatcher = target => {
+  const cust=target.custId, seq=(target.seq!=null)?target.seq:null, name=target.name, no=target.no;
+  return r=>{
+    if(!r||r.bookingStatus==='cancelled')return false;
+    if(cust)return r.custId===cust;
+    if(seq!=null)return r.seq===seq;
+    return r.name===name && String(r.no||'')===String(no||'');
+  };
+};
+// insp から予約1件を「サーバー最新値ベースでも安全に」取り除く純関数。
+//   氏名しか手掛かりが無い時は idx の行を優先、無ければ最初の一致1件だけ消す（同名の巻き添え防止）。
+//   位置は splice で詰めず blankInsp で空きに戻す＝後続行の bookingKey（代車紐付け insp-dk-idx）を壊さない。
+const removeInspBooking = (base, dk, target)=>{
+  const data=(base&&typeof base==='object'&&!Array.isArray(base))?{...base}:{};
+  let rows=(data[dk]||[]).map(r=>r||blankInsp());
+  const isT=_inspMatcher(target);
+  const nameOnly=!target.custId && target.seq==null;
+  if(nameOnly){
+    const j=(target.idx!=null&&rows[target.idx]&&isT(rows[target.idx]))?target.idx:rows.findIndex(isT);
+    if(j>=0)rows[j]=blankInsp();
+  }else{
+    rows=rows.map(r=>isT(r)?blankInsp():r);
+  }
+  while(rows.length>0 && !(rows[rows.length-1]&&rows[rows.length-1].name))rows.pop();
+  data[dk]=recomputeInspApproval(rows,(target.limit!=null)?target.limit:6);
+  return data;
+};
+// 予約が「まだ居るか」（削除の着地確認用）。氏名照合時は others（削除対象を除く同名件数）と比較。
+const inspBookingPresent = (base, dk, target)=>{
+  const rows=(base&&base[dk])||[];
+  const hits=rows.filter(_inspMatcher(target)).length;
+  if(!target.custId && target.seq==null) return hits>(target.others||0);
+  return hits>0;
+};
+// insp の予約1件のフィールドを差し替える純関数（状態変更・承認など）。対象は本人性で特定し、
+//   patch を当てて承認状態を再計算する。base のほかの日付・ほかの行には触らない。
+const patchInspBooking = (base, dk, target, patch)=>{
+  const data=(base&&typeof base==='object'&&!Array.isArray(base))?{...base}:{};
+  let rows=(data[dk]||[]).map(r=>r||blankInsp());
+  const isT=_inspMatcher(target);
+  let j=(target.idx!=null&&rows[target.idx]&&isT(rows[target.idx]))?target.idx:rows.findIndex(isT);
+  if(j>=0)rows[j]={...rows[j],...patch};
+  data[dk]=recomputeInspApproval(rows,(target.limit!=null)?target.limit:6);
+  return data;
+};
+
+// ── 重要キーを「サーバー最新値ベース」で確実に書く（customers.html の同名関数と同じ仕組み）──
+//   mutate(サーバー最新値)→保存する値 を返す。書く→少し待つ→読み返して check(読み返し値)=true なら成功。
+//   未反映なら最新値を読み直して mutate からやり直す（最大 tries 回）。sSet は no-cors で
+//   lock_timeout 等を検知できないため、この読み返しループが唯一の成否判定手段。
+//   ※sGet/sSet を呼ぶだけで BLOCK-B（データ層）自体は改変しない。
+const writeVerified=async(key,mutate,check,tries=3)=>{
+  for(let i=0;i<tries;i++){
+    let base=null;
+    try{base=await sGet(key);}catch(e){}
+    let val;
+    try{val=mutate(base);}catch(e){return false;}
+    if(val===undefined)return true; // 変更不要
+    await sSet(key,val);
+    await new Promise(r=>setTimeout(r,1500+1500*i));
+    try{ const back=await sGet(key); if(check(back))return true; }catch(e){}
+    console.warn('[WRITE] 未反映→再送',key,'attempt',i+1);
+  }
+  console.error('[WRITE] GASに反映できませんでした:',key);
+  return false;
 };
 
 // ===========================================================
@@ -6698,8 +6806,35 @@ function AppInner() {
     const t=setTimeout(run,4000);
     return()=>{cancelled=true;clearTimeout(t);};
   },[]);
-  // 表示用＝hot と 保管箱 の合体（同じ日付は hot 優先）。書き込みは常に setInspData(=hot) 経由なので保管箱は汚れない。
+  // 表示用＝hot と 保管箱 の合体（同じ日付は hot 優先）。書き込みは常に hot 経由なので保管箱は汚れない。
   const inspData = useMemo(()=> (inspArch && Object.keys(inspArch).length) ? {...inspArch, ...hotInsp} : hotInsp, [inspArch, hotInsp]);
+
+  // ── insp を「サーバー最新値ベース」で確実に変更する共通ヘルパ（第2層の一般化）──
+  //   予約消失の元凶＝「ローカル全文を書き戻す」保存経路。これを1本に集約して根絶する。
+  //   ・mutate(base) … サーバー最新値 base を受け取り、変更後の insp 全体を返す純関数。
+  //                    どんな base でも正しく動くこと（位置ではなく custId/seq/氏名で対象を特定する）。
+  //   ・confirmFn(back) … 読み返した値 back で「変更が着地したか」を返す（true=成功）。
+  //   画面は updateLocalInspData で即時反映（GAS書き込みなし＝他端末の予約を巻き添えにしない）。
+  //   実際のGAS保存は writeVerified が担い、毎回サーバー最新値を読んで mutate し直して書く。
+  //   これが insp への唯一のGAS書き込み経路（useShared 経由の setInspData 全文書き戻しは使わない）。
+  const persistInsp = useCallback((mutate, confirmFn, opts)=>{
+    const o=opts||{};
+    // 即時反映（ローカルのみ）
+    updateLocalInspData(prev=>{ try{return mutate(prev);}catch(e){return prev;} });
+    (async()=>{
+      const ok=await writeVerified(STOR+'insp',
+        base=>{ const v=mutate(base); updateLocalInspData(v); return v; },
+        back=>{ try{return !!confirmFn(back);}catch(e){return false;} }
+      );
+      if(ok){
+        if(o.pid)inspPendDrop(o.pid);
+        try{ const fresh=await sGet(STOR+'insp'); if(fresh&&typeof fresh==='object'&&!Array.isArray(fresh)) updateLocalInspData(fresh); }catch(e){}
+      }else if(o.alert!==false){
+        alert(`⚠️ ${o.name?o.name+' の':''}${o.verb||'変更'}がサーバーに反映されていません。\nもう一度お試しください。`);
+      }
+      if(typeof o.onDone==='function')o.onDone(ok);
+    })();
+  },[updateLocalInspData]);
   // 顧客リストからの仮予約（スケジュール未登録）専用ストレージ
   // キー: "名前::YYYY-M-D"  値: {status:'provisional', formData:{...}, custMonth, custRowIdx, savedAt}
   const [custBookings, setCustBookings]=useShared(STOR+'custbk',{},15000);
@@ -7317,18 +7452,21 @@ function AppInner() {
     if(!currentUser)return;
     // 削除モード
     if(isNew==='delete'){
-      // ★ setInspData前に行データを取得（setInspData後は参照できない）
+      // ★削除もサーバー最新値ベースで行う（第2層）。対象は custId/seq/氏名 で特定し、位置は詰めず
+      //   空きに戻す（後続行の bookingKey＝代車紐付けを壊さない）。他日・他行には一切触らない。
       const delRow=(inspData[dk]||[])[idx];
-      const delCustId=delRow?.custId;
-      const delName=delRow?.name;
-      const delNo=delRow?.no;
-      setInspData(prev=>{
-        const rows=[...(prev[dk]||[])].map(r=>r||blankInsp());
-        rows.splice(idx,1); // 行を完全削除
-        // 予約順(seq)で承認状態を再計算（空いた枠の分だけ承認待ちを自動承認）
-        const newRows=recomputeInspApproval(rows,inspLimits[dk]??6);
-        return{...prev,[dk]:newRows.length>0?newRows:[]};
-      });
+      const delCustId=delRow?.custId, delName=delRow?.name, delNo=delRow?.no;
+      const delSeq=(delRow&&delRow.seq!=null)?delRow.seq:null;
+      const _nameOnly=!delCustId&&delSeq==null;
+      const _others=_nameOnly
+        ?(inspData[dk]||[]).filter((r,i)=>i!==idx&&r&&r.bookingStatus!=='cancelled'&&r.name===delName&&String(r.no||'')===String(delNo||'')).length
+        :0;
+      const _tgt={custId:delCustId,seq:delSeq,name:delName,no:delNo,idx,others:_others,limit:inspLimits[dk]??6};
+      persistInsp(
+        base=>removeInspBooking(base,dk,_tgt),
+        back=>!inspBookingPresent(back,dk,_tgt),
+        {name:delName,verb:'削除'}
+      );
       // entryDate・linkedInspDateもクリア、matchName/matchNoも渡してcustId不在時も対応
       if(delCustId||delName) syncCustStatus(delCustId,'cancel',{entryDate:'',linkedInspDate:''},delName,delNo);
       return;
@@ -7366,7 +7504,7 @@ function AppInner() {
     setPendingRentalId(savedRentalId);
     setPendingRentalRec(savedRentalRec);
     setPickMode(false);setModalOpen(true);
-  },[currentUser,inspData,schedData,locks,isClosed,acquireLock,inspLimits,syncCustStatus]);
+  },[currentUser,inspData,schedData,locks,isClosed,acquireLock,inspLimits,syncCustStatus,persistInsp]);
 
   // 代車管理から予約編集を開く
   const handleOpenBooking=useCallback((type,dk,idx,slot,bookingData)=>{
@@ -7416,14 +7554,18 @@ function AppInner() {
     if(parts.length<3||isNaN(parts[0]))return;
     const [y,m,d]=parts;
     const dk=`${y}-${m}-${d}`;
-    setInspData(prev=>{
-      let rows=[...(prev[dk]||[])].map(r=>r||blankInsp());
-      if(rows[rowIdx]) rows[rowIdx]={...rows[rowIdx],bookingStatus:newStatus};
-      // ステータス変更（キャンセル等）で空いた枠を予約順(seq)で再計算して繰り上げ
-      rows=recomputeInspApproval(rows,inspLimits[dk]??6);
-      return {...prev,[dk]:rows};
-    });
-  },[setInspData,inspLimits]);
+    // ★ステータス変更もサーバー最新値ベース（第2層）。対象を custId/seq/氏名 で特定して patch する。
+    const cur=(inspData[dk]||[])[rowIdx];
+    if(!cur)return;
+    const _tgt={custId:cur.custId,seq:(cur.seq!=null)?cur.seq:null,name:cur.name,no:cur.no,idx:rowIdx,limit:inspLimits[dk]??6};
+    // 着地確認は「本人の行が newStatus になったか」。cancelled も対象なので status ガード無しで本人を探す。
+    const _idOf=r=>r&&(_tgt.custId?r.custId===_tgt.custId:(_tgt.seq!=null?r.seq===_tgt.seq:(r.name===_tgt.name&&String(r.no||'')===String(_tgt.no||''))));
+    persistInsp(
+      base=>patchInspBooking(base,dk,_tgt,{bookingStatus:newStatus}),
+      back=>{ const rows=(back&&back[dk])||[]; const j=rows.findIndex(_idOf); return j>=0 && rows[j].bookingStatus===newStatus; },
+      {name:cur.name,verb:'状態変更'}
+    );
+  },[inspData,inspLimits,persistInsp]);
 
   // 顧客リスト専用モーダル保存（仮予約 / 本予約 / キャンセル）
   const handleCustListSave=useCallback((mode, formData, meta)=>{
@@ -7449,20 +7591,22 @@ function AppInner() {
         // キャンセルするinspの行を取得
         const cancelledRow=(inspData[dk]||[])[meta.existingIdx];
         const custId=cancelledRow?.custId;
-        setInspData(prev=>{
-          const rows=[...(prev[dk]||[])].map(r=>r||blankInsp());
-          // キャンセル = 行を完全削除（空行に戻す）
-          if(rows[meta.existingIdx]) rows[meta.existingIdx]=blankInsp();
-          // 末尾の空行を整理
-          while(rows.length>0&&!rows[rows.length-1]?.name) rows.pop();
-          // 予約順(seq)で承認状態を再計算（空いた枠の分だけ承認待ちを自動承認）
-          const newRows=recomputeInspApproval(rows,inspLimits[dk]??6);
-          return{...prev,[dk]:newRows.length>0?newRows:[]};
-        });
-        // customers-filesのステータスをcancelに更新（チャンク方式）
-        // custIdがなくてもname+noでマッチング
         const matchName=cancelledRow?.name;
         const matchNo=cancelledRow?.no;
+        // ★キャンセル（＝行削除）もサーバー最新値ベース（第2層）。対象を本人性で特定して空きに戻す。
+        const _cSeq=(cancelledRow&&cancelledRow.seq!=null)?cancelledRow.seq:null;
+        const _cNameOnly=!custId&&_cSeq==null;
+        const _cOthers=_cNameOnly
+          ?(inspData[dk]||[]).filter((r,i)=>i!==meta.existingIdx&&r&&r.bookingStatus!=='cancelled'&&r.name===matchName&&String(r.no||'')===String(matchNo||'')).length
+          :0;
+        const _cTgt={custId,seq:_cSeq,name:matchName,no:matchNo,idx:meta.existingIdx,others:_cOthers,limit:inspLimits[dk]??6};
+        persistInsp(
+          base=>removeInspBooking(base,dk,_cTgt),
+          back=>!inspBookingPresent(back,dk,_cTgt),
+          {name:matchName,verb:'キャンセル'}
+        );
+        // customers-filesのステータスをcancelに更新（チャンク方式）
+        // custIdがなくてもname+noでマッチング
         if(custId||matchName){
           syncCustStatus(custId,'cancel',{entryDate:'',linkedInspDate:''},matchName,matchNo);
           // custBookingsからも削除（handleDeleteModalとの動作を統一）
@@ -7537,31 +7681,20 @@ function AppInner() {
       // キャンセル済みスロットは再利用せず、本当に空のスロットを使う。
       const existIdx=(meta&&meta.existingDk===dk&&meta.existingIdx!=null&&meta.existingIdx>=0)
         ?meta.existingIdx:-1;
-      setInspData(prev=>{
-        const prev_rows=(prev[dk]||[]).map(r=>r||blankInsp());
-        let rows=[...prev_rows];
-        const ui=existIdx>=0?existIdx:(()=>{
-          // キャンセル済みは除外し、本当に名前がないスロットのみ対象
-          const i=rows.findIndex(r=>!r||!r.name);
-          return i>=0?i:rows.length;
-        })();
-        while(rows.length<=ui)rows.push(blankInsp());
-        const _prevRow=prev_rows[ui];
-        // 同一のアクティブ予約を編集している時だけ既存のseq・状態を引き継ぐ。
-        // 空き／キャンセル済みスロットへの新規予約は必ず新しいseqを付与（予約順の最後に並ぶ）。
-        const _editingActive=!!(_prevRow&&_prevRow.name&&_prevRow.bookingStatus!=='cancelled');
-        const _seq=_editingActive?_prevRow.seq:Date.now();
-        const _wasPending=_editingActive&&!!_prevRow.pendingApproval;
+      // ★リストからの本予約もサーバー最新値ベース（第2層・buildInspSave経由）。
+      //   既存編集は existIdx を上書き、新規は空きスロットへ（サーバー側で埋まっていれば逃がす）。
+      const _clUi=existIdx>=0?existIdx:(()=>{const r=(inspData[dk]||[]);const i=r.findIndex(x=>!x||!x.name);return i>=0?i:r.length;})();
+      const _clParams={targetDk:dk,origDk:null,isDateChange:false,dcPlaceIdx:_clUi,modalIdx:_clUi,row:{...cs},limits:inspLimits,seq:Date.now(),wasEditing:existIdx>=0};
+      let _clPending=false;
+      persistInsp(
+        base=>{ const b=buildInspSave(base,_clParams); _clPending=b.pendingNow; return b.result; },
+        back=>{ const rows=(back&&back[dk])||[]; return rows.some(r=>r&&r.bookingStatus!=='cancelled'&&(cs.custId?r.custId===cs.custId:(r.name===cs.name&&String(r.no||'')===String(cs.no||'')))); },
+        {name:cs.name,verb:'保存'}
+      );
+      if(_clPending){
         const lim=inspLimits[dk]??6;
-        rows[ui]={...cs,seq:_seq,bookingStatus:'confirmed'};
-        // 予約順(seq)で承認状態を再計算（既存の確定行は確定のまま＝編集で承認を再要求しない）
-        rows=recomputeInspApproval(rows,lim);
-        // 新規／再予約が上限超過で「承認待ちに転じた」ときだけ通知（編集中の確定客には出さない）
-        if(rows[ui]&&rows[ui].pendingApproval&&!_wasPending){
-          alert(`⚠️ 1日の上限を超えたため、本店承認が必要です（通常${lim}台／レギュラー車検3台）。`);
-        }
-        return{...prev,[dk]:rows};
-      });
+        alert(`⚠️ 1日の上限を超えたため、本店承認が必要です（通常${lim}台／レギュラー車検3台）。`);
+      }
       if(meta&&meta.bkKey)setCustBookings(prev=>{const n={...prev};delete n[meta.bkKey];return n;});
       updateFiles();
       // customers-files の連動更新（custId があれば）
@@ -7580,7 +7713,7 @@ function AppInner() {
         }
       }
     }
-  },[inspLimits,setInspData,setCustBookings,setCustFiles,inspData]);
+  },[inspLimits,setCustBookings,setCustFiles,inspData,persistInsp]);
 
   // 顧客リストから既存予約を編集（ビュー遷移なし）
   const handleCustEditBooking=useCallback((type,dk,idx,slot,bookingData,custMeta)=>{
@@ -7712,58 +7845,40 @@ function AppInner() {
         }
       } else {
         // ── 本予約（またはスケジュール画面から）：inspDataに書く ──
-        setInspData(prev=>{
-          const sd=selDateRef.current||selDate;
-            const _tdk=formData._targetDk;
-          const targetDk=_tdk||modalDkRef.current||(sd instanceof Date?`${sd.getFullYear()}-${sd.getMonth()+1}-${sd.getDate()}`:(typeof sd==='string'&&sd?sd:modalDk));
-          const prev_rows=(prev[targetDk]||[]).map(r=>r||blankInsp());
-          let rows=[...prev_rows];
-          const _origDk=formData._originalDk||originalModalDkRef.current;
-          const _isDateChange=!!(_origDk&&_origDk!==targetDk);
-          // ★配置先インデックス：通常は modalIdx。日付変更で移動先の同じ行番号に別の予約が
-          //   ある場合は事前計算の空きスロット（_dcPlaceIdx）へ。万一その間に埋まっていたら
-          //   この時点のprevから空きを再探索（上書き消失だけは絶対に起こさない）。
-          let _idxPlace=_isDateChange?_dcPlaceIdx:modalIdx;
-          if(_isDateChange&&rows[_idxPlace]&&rows[_idxPlace].name){
-            const _fb=rows.findIndex(r=>!r||!r.name);
-            _idxPlace=_fb>=0?_fb:rows.length;
-          }
-          while(rows.length<=_idxPlace)rows.push(blankInsp());
-          const _prevRow=prev_rows[_idxPlace];
-          // 同一のアクティブ予約を編集している時だけ既存のseq・状態を引き継ぐ。
-          // 空き／キャンセル済みスロットへの新規予約は必ず新しいseqを付与（予約順の最後に並ぶ）。
-          const _editingActive=!!(_prevRow&&_prevRow.name&&_prevRow.bookingStatus!=='cancelled');
-          const _seq=_editingActive?_prevRow.seq:Date.now();
-          const _wasPending=_editingActive&&!!_prevRow.pendingApproval;
-          const dayLimit=inspLimits[targetDk]??6;
-          const _newRow={...cleanWithStore,seq:_seq,bookingStatus:'confirmed'};
-          if(_isDateChange){
-            // 日付変更＝移動先で承認状態を再評価する。元の日の承認/承認待ちフラグは引き継がず、
-            // 予約順は移動先の最後尾扱いに。recomputeで上限内なら自動的に確定（承認が外れる）。
-            delete _newRow.approved;
-            delete _newRow.pendingApproval;
-            _newRow.seq=Date.now();
-            // 行が新しい位置に移るため、代車紐付け用bookingKeyも新位置で振り直す
-            _newRow.bookingKey=`insp-${targetDk}-${_idxPlace}`;
-          }
-          rows[_idxPlace]=_newRow;
-          // 予約順(seq)で承認状態を再計算（既存の確定行は確定のまま＝編集で承認を再要求しない）
-          rows=recomputeInspApproval(rows,dayLimit);
-          // 新規／再予約が上限超過で「承認待ちに転じた」ときだけ通知（編集中の確定客には出さない）
-          if(rows[_idxPlace]&&rows[_idxPlace].pendingApproval&&!_wasPending){
-            alert(`⚠️ 1日の上限を超えたため、本店承認が必要です（通常${dayLimit}台／レギュラー車検3台）。`);
-          }
-          console.log('[SAVE]','targetDk=',targetDk,'modalDk=',modalDk,'prev keys=',Object.keys(prev).join(','));
-          const result={...prev,[targetDk]:rows};
-          const origDk=formData._originalDk||originalModalDkRef.current;
-          if(origDk&&origDk!==targetDk&&prev[origDk]){
-            let oldRows=[...(prev[origDk]||[])];if(oldRows[modalIdx])oldRows[modalIdx]=blankInsp();
-            // 日付変更で空いた旧日の枠も再計算（空いた分だけ承認待ちを昇格）
-            oldRows=recomputeInspApproval(oldRows,inspLimits[origDk]??6);
-            result[origDk]=oldRows;
-          }
-          return result;
+        //   ★第2層（2026-07-24）：初回保存も「サーバー最新値ベース」で書く。
+        //     ここでは updateLocalInspData で画面だけ即時反映（GAS書き込みなし＝他端末の予約を
+        //     巻き添えにしない）。実際のGAS保存は後段の writeVerified が担い、保存のたびに
+        //     サーバー最新値を読んで buildInspSave し直す（＝全文書き戻しの廃止）。
+        const _sdP=selDateRef.current||selDate;
+        const _targetDk=formData._targetDk||modalDkRef.current||(_sdP instanceof Date?`${_sdP.getFullYear()}-${_sdP.getMonth()+1}-${_sdP.getDate()}`:(typeof _sdP==='string'&&_sdP?_sdP:modalDk));
+        const _origDkP=formData._originalDk||originalModalDkRef.current;
+        // buildInspSave に渡す配置パラメータ。row/limits/seq は保存確定時のスナップショット。
+        const _saveParams={
+          targetDk:_targetDk,
+          origDk:_origDkP,
+          isDateChange:!!(_origDkP&&_origDkP!==_targetDk),
+          dcPlaceIdx:_dcPlaceIdx,
+          modalIdx,
+          row:{...cleanWithStore},
+          limits:inspLimits,
+          seq:Date.now(),
+        };
+        let _pendingNow=false;
+        updateLocalInspData(prev=>{
+          // wasEditing＝この保存が「今その枠にある自分のアクティブ予約」の編集か。ローカル最新から判定し、
+          //   サーバー側 build でも同じ値を使う（サーバーの占有状況で編集/新規が揺れないようにする）。
+          const _slot=(prev[_targetDk]||[])[_saveParams.isDateChange?_dcPlaceIdx:modalIdx];
+          _saveParams.wasEditing=!!(_slot&&_slot.name&&_slot.bookingStatus!=='cancelled');
+          const b=buildInspSave(prev,_saveParams);
+          _pendingNow=b.pendingNow;
+          return b.result;
         });
+        // 新規／再予約が上限超過で「承認待ちに転じた」ときだけ通知（編集中の確定客には出さない）
+        if(_pendingNow){
+          const _dl=inspLimits[_targetDk]??6;
+          alert(`⚠️ 1日の上限を超えたため、本店承認が必要です（通常${_dl}台／レギュラー車検3台）。`);
+        }
+        console.log('[SAVE]','targetDk=',_targetDk,'modalDk=',modalDk,'wasEditing=',_saveParams.wasEditing);
         // ★リストから予約した顧客（custIdあり）の保存内容を顧客リストへ連動更新する。
         //   path1（顧客リストからの予約作成）と同じ syncCustStatus の仕組み。cust-updatesキュー経由で反映。
         //   入庫日だけでなくコース・店舗・担当・特典・備考・入庫時間も同期する
@@ -7803,42 +7918,41 @@ function AppInner() {
             setTimeout(()=>_syncVerify(0),2500);
           }
         }
-        // ★保存後検証：sSetはno-corsでGAS側の失敗(lock_timeout等)を検知できないため、
-        //   数秒後にGASを読み返して保存行が実在するか確認。未反映ならローカル状態を再送、
-        //   それでも反映されなければアラート（無音失敗→ポーリングで巻き戻る事故の防止）。
+        // ★GAS保存（第2層の本体）：サーバー最新値を読んで buildInspSave し直してから書き、
+        //   読み返して着地を確認。未反映ならサーバー最新値からやり直す（最大3回）。これが
+        //   insp への唯一のGAS書き込み経路（useShared 経由の全文書き戻しは通さない）。
         {
-          const _sd3=selDateRef.current||selDate;
-          const _vDk=formData._targetDk||modalDkRef.current||(_sd3 instanceof Date?`${_sd3.getFullYear()}-${_sd3.getMonth()+1}-${_sd3.getDate()}`:(typeof _sd3==='string'&&_sd3?_sd3:modalDk));
+          const _vDk=_targetDk;
           const _vName=cleanWithStore.name,_vNo=cleanWithStore.no,_vCust=cleanWithStore.custId;
           if(_vDk&&_vName){
-            // ★未反映を見失わない控え：検証開始時に積み、反映を確認できたら落とす。残れば起動時に再送。
+            // ★未反映を見失わない控え：保存開始時に積み、着地を確認できたら落とす。残れば起動時に検出。
             const _pid='insp-'+Date.now()+'-'+Math.random().toString(36).slice(2,7);
             inspPendAdd({pid:_pid, dk:_vDk, row:{...cleanWithStore}, ts:Date.now()});
-            const _verify=async(attempt)=>{
-              try{
-                const remote=await sGet(STOR+'insp');
-                if(!remote||typeof remote!=='object'){
-                  // ★読み返し自体の失敗＝未確認。黙って成功扱いにせず再確認、最終的にダメなら知らせる（控えは残す）
-                  if(attempt<2){setTimeout(()=>_verify(attempt+1),8000);}
-                  else{alert(`⚠️ ${_vName} の予約保存を確認できませんでした（通信不安定）。\n画面を再読み込みして予約が残っているか確認してください。`);}
-                  return;
-                }
-                const rows=remote[_vDk]||[];
-                const ok=rows.some(r=>r&&(_vCust?r.custId===_vCust:(r.name===_vName&&String(r.no||'')===String(_vNo||''))));
-                if(ok){console.log('[VERIFY insp] ok',_vName,_vDk);inspPendDrop(_pid);return;}
-                console.warn('[VERIFY insp] 未反映 attempt='+attempt,_vName,_vDk);
-                if(attempt<2){
-                  // ★再送はサーバー最新値に該当予約1件だけを足す（従来の {...prev} 全文書き戻しは
-                  //   ローカルが古いと他端末の予約を巻き添えで消すため廃止。削除側 _delVerify と同じ方式）。
-                  const {data:fixed,changed}=applyBookingToInspBase(remote,_vDk,cleanWithStore,inspLimits[_vDk]??6);
-                  if(changed)await sSet(STOR+'insp',fixed);
-                  setTimeout(()=>_verify(attempt+1),8000);
-                }else{
-                  alert(`⚠️ ${_vName} の予約保存がサーバーに反映されていません。\nもう一度開いて保存し直してください。`);
-                }
-              }catch(e){}
+            const _has=obj=>{
+              const rows=(obj&&obj[_vDk])||[];
+              return rows.some(r=>r&&r.bookingStatus!=='cancelled'&&(_vCust?r.custId===_vCust:(r.name===_vName&&String(r.no||'')===String(_vNo||''))));
             };
-            setTimeout(()=>_verify(0),6000);
+            (async()=>{
+              const ok=await writeVerified(STOR+'insp',
+                base=>{
+                  // 毎回サーバー最新値から組み立て直す。組み立てた結果は画面にも即反映して、
+                  // 書き込み待ちの間にポーリングが走っても予約が一瞬消えないようにする。
+                  const b=buildInspSave(base,_saveParams);
+                  if(b.relocated)console.warn('[SAVE insp] 配置先が他端末の予約で埋まっていたため空き行へ移しました idx=',b.idxPlace);
+                  updateLocalInspData(b.result);
+                  return b.result;
+                },
+                back=>_has(back)
+              );
+              if(ok){
+                console.log('[VERIFY insp] ok',_vName,_vDk);
+                inspPendDrop(_pid);
+                // 画面を「実際に書けたサーバー最新値」に合わせ直す（他端末の予約も取り込む）
+                try{ const fresh=await sGet(STOR+'insp'); if(fresh&&typeof fresh==='object'&&!Array.isArray(fresh)) updateLocalInspData(fresh); }catch(e){}
+              }else{
+                alert(`⚠️ ${_vName} の予約保存がサーバーに反映されていません。\nもう一度開いて保存し直してください。`);
+              }
+            })();
           }
         }
         // 日付変更時：古い代車予約を削除（pendingLoanerDeleteBk または _originalDkから計算）
@@ -7947,7 +8061,7 @@ function AppInner() {
     setCurLockKey(null);
     setTimeout(()=>releaseLock(keyToRelease),200);
     setFromCustList(false);setCustModalMeta(null);
-  },[modalType,modalDk,modalIdx,modalSlot,vsId,curLockKey,releaseLock,setInspData,setSchedData,schedData,setLoanerRes,selDate,schedRestrictions,setModalOpen,inspLimits,pendingRentalId,pendingRentalRec,pendingLoanerId,pendingLoanerData,dynRentalCars,fromCustList,custModalMeta,setCustBookings,setCustFiles,inspData]);
+  },[modalType,modalDk,modalIdx,modalSlot,vsId,curLockKey,releaseLock,setInspData,updateLocalInspData,setSchedData,schedData,setLoanerRes,selDate,schedRestrictions,setModalOpen,inspLimits,pendingRentalId,pendingRentalRec,pendingLoanerId,pendingLoanerData,dynRentalCars,fromCustList,custModalMeta,setCustBookings,setCustFiles,inspData]);
 
   const handleDeleteModal=useCallback(()=>{
     // bookingKeyを特定してloanerRes・rentalResも連動削除
@@ -7962,15 +8076,19 @@ function AppInner() {
       const cancelCustId=cancelledRow?.custId;
       const cancelName=cancelledRow?.name;
       const cancelNo=cancelledRow?.no;
-      setInspData(prev=>{
-        const rows=(prev[modalDk]||[]).map(r=>r||blankInsp());
-        rows[modalIdx]=blankInsp(); // スケジュールから完全削除（cancelled表示を残さない）
-        // 末尾の空行を整理
-        while(rows.length>0&&!rows[rows.length-1]?.name) rows.pop();
-        // 予約順(seq)で承認状態を再計算（空いた枠の分だけ承認待ちを自動承認）
-        const newRows=recomputeInspApproval(rows,inspLimits[modalDk]??6);
-        return{...prev,[modalDk]:newRows.length>0?newRows:[]};
-      });
+      const cancelSeq=(cancelledRow&&cancelledRow.seq!=null)?cancelledRow.seq:null;
+      // ★削除もサーバー最新値ベース（第2層）。対象を custId/seq/氏名 で特定し、空きに戻して書く。
+      //   氏名しか手掛かりが無い時は削除前の同名件数(others)と比べて着地判定する。
+      const _delNameOnly=!cancelCustId&&cancelSeq==null;
+      const _delOthers=_delNameOnly
+        ?(inspData[modalDk]||[]).filter((r,i)=>i!==modalIdx&&r&&r.bookingStatus!=='cancelled'&&r.name===cancelName&&String(r.no||'')===String(cancelNo||'')).length
+        :0;
+      const _delTgt={custId:cancelCustId,seq:cancelSeq,name:cancelName,no:cancelNo,idx:modalIdx,others:_delOthers,limit:inspLimits[modalDk]??6};
+      persistInsp(
+        base=>removeInspBooking(base,modalDk,_delTgt),
+        back=>!inspBookingPresent(back,modalDk,_delTgt),
+        {name:cancelName,verb:'削除'}
+      );
       // ★顧客リストのステータスをcancelに連動。
       //   ただし custId が無い手入力の予約は、同名の予約が他にも残っている場合は通知しない
       //   （重複入力の片方を消しただけで、リスト発の予約までキャンセル扱いにしてしまうため）。
@@ -8011,66 +8129,16 @@ function AppInner() {
       return next;
     });
 
-    // 削除の無音失敗対策。insp削除のsSetがGAS側で失敗するとポーリングで予約が復活する。
-    // 数秒後にGASを読み返し、当該予約が残っていたら再送（最大2回）、最終的にダメならアラート。
-    // リストへのキャンセル通知(cust-updates)もキューに入ったか確認し未反映なら再送。
+    // insp削除の着地確認は上の persistInsp が担う（サーバー最新値から対象行だけを消して書き、
+    // 読み返しで消えたか確認、未反映なら最新値からやり直し、最終的にダメならアラート）。
+    // ここではリストへのキャンセル通知(cust-updates)がキューに入ったかだけを別途確認する。
     if(modalType==='insp'){
       const _drow=(inspData[modalDk]||[])[modalIdx];
-      const _vDk=modalDk,_vCust=_drow&&_drow.custId,_vName=_drow&&_drow.name,_vNo=_drow&&_drow.no;
-      const _vSeq=(_drow&&_drow.seq!=null)?_drow.seq:null;
-      // ★同じ日に同名の予約が2件あると（リスト発＋手入力の重複など）、氏名照合では「消したのに
-      //   残っている」と誤判定して警告を出してしまう（2026-07-13の菊池）。custId → seq(行ごとに一意)
-      //   → 氏名 の順で本人を特定し、氏名しか手掛かりが無い時は削除前の同名件数と比べて判定する。
-      const _isTarget=function(r){
-        if(!r||r.bookingStatus==='cancelled')return false;
-        if(_vCust)return r.custId===_vCust;
-        if(_vSeq!=null)return r.seq===_vSeq;
-        return r.name===_vName&&String(r.no||'')===String(_vNo||'');
-      };
-      const _nameOnly=!_vCust&&_vSeq==null;
-      const _vOthers=_nameOnly
-        ?(inspData[_vDk]||[]).filter(function(r,i){return i!==modalIdx&&r&&r.bookingStatus!=='cancelled'&&r.name===_vName&&String(r.no||'')===String(_vNo||'');}).length
-        :0;
-      if(_vCust||_vName){
-        // ★検証は長めに（8→20→40→60秒）。GAS混雑時は書き込みがロック待ちで数十秒かかることがあり、
-        //   6+8+8秒しか待たない従来のままだと、実際には消えているのに「反映されていません」と
-        //   誤警告していた（2026-07-13の菊池。サーバー確認では削除は成功していた）。
-        //   再送もローカル全文の再送ではなく、サーバー最新値から対象行だけを消して書く。
-        const _DELAYS=[8000,20000,40000,60000];
-        const _delVerify=async(attempt)=>{
-          try{
-            const remote=await sGet(STOR+'insp');
-            if(!remote||typeof remote!=='object'){
-              if(attempt<_DELAYS.length-1)setTimeout(function(){_delVerify(attempt+1);},_DELAYS[attempt+1]);
-              return;
-            }
-            const rows=remote[_vDk]||[];
-            const _hits=rows.filter(_isTarget).length;
-            const stillThere=_nameOnly?(_hits>_vOthers):(_hits>0);
-            if(!stillThere)return; // 消えている＝成功（警告は出さない）
-            if(attempt<_DELAYS.length-1){
-              // サーバー最新値から対象行だけを消して再送（他端末の予約を巻き添えにしない）
-              const fixed=Object.assign({},remote);
-              const kept=(fixed[_vDk]||[]).slice();
-              if(_nameOnly){
-                // 同名が複数あり得るので、消すのは1行だけ（元の位置の行、無ければ最初の一致）
-                const j=(kept[modalIdx]&&_isTarget(kept[modalIdx]))?modalIdx:kept.findIndex(_isTarget);
-                if(j>=0)kept[j]=blankInsp();
-              }else{
-                for(let i=0;i<kept.length;i++)if(_isTarget(kept[i]))kept[i]=blankInsp();
-              }
-              while(kept.length>0&&!(kept[kept.length-1]&&kept[kept.length-1].name))kept.pop();
-              fixed[_vDk]=recomputeInspApproval(kept,inspLimits[_vDk]??6);
-              await sSet(STOR+'insp',fixed);
-              setTimeout(function(){_delVerify(attempt+1);},_DELAYS[attempt+1]);
-            }
-            else alert('警告: '+_vName+' の削除がサーバーに反映されていません。もう一度開いて削除し直してください。');
-          }catch(e){}
-        };
-        setTimeout(function(){_delVerify(0);},_DELAYS[0]);
-        // キャンセル通知の再送確認は custId が分かっている（＝リスト発の予約）時だけ。
-        // 手入力の予約を氏名だけで再送すると、宛先のいない通知がリストのキューに溜まり
-        // 「反映中…」が消えなくなる（2026-07-13の菊池）。
+      const _vCust=_drow&&_drow.custId,_vName=_drow&&_drow.name,_vNo=_drow&&_drow.no;
+      // キャンセル通知の再送確認は custId が分かっている（＝リスト発の予約）時だけ。
+      // 手入力の予約を氏名だけで再送すると、宛先のいない通知がリストのキューに溜まり
+      // 「反映中…」が消えなくなる（2026-07-13の菊池）。
+      if(_vCust){
         const _cancelVerify=async(attempt)=>{
           try{
             const q=await sGet(STOR+'cust-updates');
@@ -8079,32 +8147,27 @@ function AppInner() {
             if(attempt<2){syncCustStatus(_vCust,'cancel',{entryDate:'',linkedInspDate:''},_vName,_vNo);setTimeout(function(){_cancelVerify(attempt+1);},3000);}
           }catch(e){}
         };
-        if(_vCust)setTimeout(function(){_cancelVerify(0);},2500);
+        setTimeout(function(){_cancelVerify(0);},2500);
       }
     }
 
     releaseLock(curLockKey);setCurLockKey(null);setModalOpen(false);
-  },[modalType,modalDk,modalIdx,modalSlot,curLockKey,releaseLock,setInspData,setSchedData,setLoanerRes,setRentalResData,inspData,syncCustStatus,inspLimits]);
+  },[modalType,modalDk,modalIdx,modalSlot,curLockKey,releaseLock,persistInsp,setSchedData,setLoanerRes,setRentalResData,inspData,syncCustStatus,inspLimits]);
 
-  // 承認ハンドラー
+  // 承認ハンドラー（承認もサーバー最新値ベース。対象を本人性で特定し approved を立てる）
   const handleApprove=useCallback((dk,idx)=>{
-    setInspData(prev=>{
-      let rows=(prev[dk]||[]).map(r=>r||blankInsp());
-      if(rows[idx]){
-        const updated={...rows[idx]};
-        delete updated.pendingApproval;
-        updated.approved=true;
-        rows[idx]=updated;
-      }
-      // 承認後も予約順(seq)で整合（承認済みは確定として固定）
-      rows=recomputeInspApproval(rows,inspLimits[dk]??6);
-      return{...prev,[dk]:rows};
-    });
-  },[setInspData,inspLimits]);
+    const cur=(inspData[dk]||[])[idx];
+    if(!cur)return;
+    const _tgt={custId:cur.custId,seq:(cur.seq!=null)?cur.seq:null,name:cur.name,no:cur.no,idx,limit:inspLimits[dk]??6};
+    persistInsp(
+      base=>patchInspBooking(base,dk,_tgt,{approved:true,pendingApproval:undefined}),
+      back=>{ const rows=(back&&back[dk])||[]; const j=rows.findIndex(_inspMatcher(_tgt)); return j>=0 && rows[j].approved===true && !rows[j].pendingApproval; },
+      {name:cur.name,verb:'承認'}
+    );
+  },[inspData,inspLimits,persistInsp]);
 
   // ★ 起動時：GASから直接読み込み不要な pendingApproval を一括解除
-  // 重要: setInspData は prev（現在の最新state）とマージして書き戻すため
-  //        customers.html から直前に書き込まれた予約を消さない
+  // ★書き込みは writeVerified でサーバー最新値ベースに行う（全文書き戻ししない＝第2層と統一）。
   useEffect(()=>{
     const t=setTimeout(async()=>{
       try{
@@ -8114,30 +8177,33 @@ function AppInner() {
         ]);
         const limitsMap=latestLimits&&typeof latestLimits==='object'?latestLimits:{};
         if(!latestInsp||typeof latestInsp!=='object')return;
-        // 変更があった日付のみ fixed に格納（変更なし日付は含めない）
-        const fixed={};
-        for(const dk of Object.keys(latestInsp)){
+        // 昇格が要る日付だけを対象に（承認待ち→確定。降格はしない＝旧データを壊さない）
+        const targets=Object.keys(latestInsp).filter(dk=>{
           const rows=latestInsp[dk]||[];
-          if(!Array.isArray(rows)||rows.length===0)continue;
-          if(!rows.some(r=>r?.name&&r?.pendingApproval&&r?.bookingStatus!=='cancelled'))continue;
-          const lim=limitsMap[dk]??6;
-          // 予約順(seq)で再計算。起動時は「昇格のみ」（承認待ち→確定）。
-          // 既存の確定行を承認待ちに降格させることはしない（旧データを壊さない）。
-          const rc=recomputeInspApproval(rows,lim);
-          let changed=false;
-          const newRows=rows.map((r,i)=>{
-            if(!r)return r;
-            const wasPending=!!r.pendingApproval;
-            const nowPending=!!(rc[i]&&rc[i].pendingApproval);
-            if(wasPending&&!nowPending){changed=true;const{pendingApproval:_,...rest}=r;return rest;}
-            return r;
-          });
-          if(changed)fixed[dk]=newRows;
-        }
-        if(Object.keys(fixed).length===0)return;
-        // prev（現在のstate = localRef.current）とマージして書き戻す
-        // → fixed に含まれない日付（直前にcustomers.htmlが書いた予約等）は必ず保持される
-        setInspData(prev=>({...prev,...fixed}));
+          if(!Array.isArray(rows)||rows.length===0)return false;
+          if(!rows.some(r=>r?.name&&r?.pendingApproval&&r?.bookingStatus!=='cancelled'))return false;
+          const rc=recomputeInspApproval(rows,limitsMap[dk]??6);
+          return rows.some((r,i)=>r&&r.pendingApproval&&rc[i]&&!rc[i].pendingApproval);
+        });
+        if(targets.length===0)return;
+        // サーバー最新値(base)を受け取り、対象日だけ pendingApproval を昇格させる純関数。
+        // fixed の全文書き戻しではないので、対象外の日付（他端末が直前に書いた予約等）は base のまま。
+        const promote=base=>{
+          const data=(base&&typeof base==='object'&&!Array.isArray(base))?{...base}:{};
+          for(const dk of targets){
+            const rows=data[dk]||[];
+            if(!Array.isArray(rows)||rows.length===0)continue;
+            const rc=recomputeInspApproval(rows,limitsMap[dk]??6);
+            data[dk]=rows.map((r,i)=>{
+              if(!r)return r;
+              if(r.pendingApproval&&rc[i]&&!rc[i].pendingApproval){const{pendingApproval:_,...rest}=r;return rest;}
+              return r;
+            });
+          }
+          return data;
+        };
+        updateLocalInspData(promote);
+        await writeVerified(STOR+'insp', b=>{const v=promote(b);updateLocalInspData(v);return v;}, ()=>true);
       }catch{}
     },2000);
     return()=>clearTimeout(t);
@@ -8237,17 +8303,24 @@ function AppInner() {
       const m=bk.match(/^insp-(.+)-(\d+)$/);
       if(m){
         const dk=m[1], idx=Number(m[2]);
-        setInspData(prev=>{
-          const rows=[...(prev[dk]||[])];
-          if(rows[idx]&&(rows[idx].loaner||rows[idx].loanerId)){
-            rows[idx]={...rows[idx],loaner:'',loanerId:null};
-            return{...prev,[dk]:rows};
-          }
-          return prev;
-        });
+        // insp側のloanerフィールドクリアもサーバー最新値ベース（第2層）。bookingKeyは位置(idx)を
+        // 指すのでidxで対象行を特定する。失敗しても軽微（代車ラベルが残るだけ）なのでアラートは出さない。
+        persistInsp(
+          base=>{
+            const data=(base&&typeof base==='object'&&!Array.isArray(base))?{...base}:{};
+            const rows=[...(data[dk]||[])];
+            if(rows[idx]&&(rows[idx].loaner||rows[idx].loanerId)){
+              rows[idx]={...rows[idx],loaner:'',loanerId:null};
+              data[dk]=rows;
+            }
+            return data;
+          },
+          back=>{ const rows=(back&&back[dk])||[]; return !rows[idx]||!(rows[idx].loaner||rows[idx].loanerId); },
+          {alert:false}
+        );
       }
     }
-  },[setLoanerRes,setInspData]);
+  },[setLoanerRes,persistInsp]);
   const undoLoanerRes=useCallback(()=>{if(!loanerUndo.length){return;}setLoanerRes(loanerUndo[loanerUndo.length-1].prevState);setLoanerUndo(u=>u.slice(0,-1));},[loanerUndo,setLoanerRes]);
   // ⑤ 限定：この予約の代車を固定（最適化で動かさない）。locked を反転する。
   const toggleLoanerLock=useCallback((cid,resId)=>{
