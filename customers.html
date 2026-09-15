@@ -15,11 +15,16 @@
   // 開きっぱなしのタブが旧コードのまま動き続けるのを防ぐ。画面復帰時と定期に自分自身を
   // no-store+クエリ付きで取得し、__APP_BUILD が変わっていれば「更新」バナーを表示する。
   // 本番デプロイ時は port_to_main.js が __APP_BUILD を自動更新する（手動更新不要）。
-  window.__APP_BUILD='build-1788442677054';
+  window.__APP_BUILD='build-1789450224570';
   (function(){
     var RUNNING=window.__APP_BUILD, shown=false, checking=false;
+    function runningVer(){
+      try{ var s=document.querySelectorAll('script');   /* モバイルは変換結果を別scriptに入れ直すので、種類を問わず全部見る */
+        for(var i=0;i<s.length;i++){ var mm=s[i].textContent.match(/(?:APP_VERSION|MOBILE_VERSION)\s*=\s*'([^']+)'/); if(mm)return mm[1]; } }catch(e){}
+      return '';
+    }
     function banner(){
-      if(shown||!document.body)return; shown=true;
+      if(shown)return; if(!document.body){setTimeout(banner,500);return;} shown=true;   // 本文がまだ無い（CDNの読み込み待ち）なら少し待って出す。以前はここで諦めて帯が出なかった
       var b=document.createElement('div');
       b.textContent='🔄 新しいバージョンがあります（タップして更新）';
       b.style.cssText='position:fixed;left:0;right:0;bottom:0;z-index:2147483647;background:#1d4ed8;color:#fff;text-align:center;padding:14px 12px;font-weight:800;font-size:15px;cursor:pointer;box-shadow:0 -2px 12px rgba(0,0,0,.35)';
@@ -48,13 +53,15 @@
         if(res&&res.ok){
           var t=await res.text();
           var m=t.match(/__APP_BUILD='(build-\d+)'/);
-          if(m&&m[1]!==RUNNING)banner();
+          // ★ビルド識別子だけでなく、バージョン番号の違いでも出す（識別子の更新忘れ対策・2026-09-12）。
+          var mv=t.match(/(?:APP_VERSION|MOBILE_VERSION)\s*=\s*'([^']+)'/), rv=runningVer();
+          if((m&&m[1]!==RUNNING)||(mv&&rv&&mv[1]!==rv))banner();
         }
       }catch(e){}
       checking=false;
     }
     document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible')check();});
-    setTimeout(check,30000);
+    setTimeout(check,8000);   // 開いてすぐ（8秒）に1回。古い画面のまま使い始めないように
     setInterval(check,15*60*1000);
   })();
 </script>
@@ -65,8 +72,12 @@
 <style>
 *{box-sizing:border-box;margin:0;padding:0;}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Hiragino Sans",sans-serif;background:#f8fafc;color:#1e293b;font-size:13px;}
-::-webkit-scrollbar{width:5px;height:5px;}
-::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:3px;}
+/* スクロールバーは太めに。細いとマウスで掴みにくい（ユーザー要望・2026-09-11） */
+::-webkit-scrollbar{width:14px;height:12px;}
+::-webkit-scrollbar-track{background:#f1f5f9;}
+::-webkit-scrollbar-thumb{background:#a8b3c2;border-radius:8px;border:3px solid #f1f5f9;}
+::-webkit-scrollbar-thumb:hover{background:#7b8798;}
+*{scrollbar-width:auto;}
 button{cursor:pointer;font-family:inherit;}
 input,select,textarea{font-family:inherit;}
 .row-none    {background:white;}
@@ -95,12 +106,76 @@ const {useState,useEffect,useCallback,useMemo,useRef,memo}=React;
 // 定数
 // ═══════════════════════════════════════════
 const GAS_URL='https://script.google.com/macros/s/AKfycbyNE1eVKjibSPLEA0HrVZI8NxEFKWQfMYQ6cKoM1Gznauy9AhfZqHzgs1zzMaxXnQ1_/exec';
-const GAS_API_KEY='hub2026co-f466kt5vs3vnDQDPuwWeS6XM';
+// ★利用者認証（v14以降・Kyoshi承認のBLOCK-B変更・2026-09-03）
+//   apiKey は「本来のキー|利用証」の形で送る。GAS側は '|' の前だけを本来のキーとして
+//   照合し、後ろを利用証として検証する。既存の通信コードに手を入れずに済ませるため。
+const HUB_BASE_KEY='hub2026co-f466kt5vs3vnDQDPuwWeS6XM';
+let GAS_API_KEY=HUB_BASE_KEY;
+const hubApplyToken=t=>{GAS_API_KEY=t?(HUB_BASE_KEY+'|'+t):HUB_BASE_KEY;};
 const STOR='hub-v8-';
+// 端末に保存した利用証を起動時に載せる（STORの宣言後に読む必要があるためここ）
+const HUB_TOKEN_KEY=STOR+'auth-token';
+try{const _t=localStorage.getItem(HUB_TOKEN_KEY);if(_t)hubApplyToken(_t);}catch(e){}
+// ★利用者認証の土台（v2.20 / 2026-09-04・Kyoshi承認のBLOCK-B変更）
+//   この端末で本人確認を済ませた人の「利用証」だけを持ち歩く。
+//   利用証は人ごと・端末ごとに1枚。使うたびに期限が90日先へ延びる（スライド式）ので、
+//   毎日使う人が締め出されることはない。3か月まったく開かれなかった端末だけが失効する。
+//   3ファイル（index_dev / customers / mobile）に同一のものを置くこと。
+const HUB_MINE_KEY = STOR + 'auth-mine';   // この端末の登録者 [{uid,name,myNumber,store,token,exp}]
+const HUB_KIND_KEY = STOR + 'auth-kind';   // 'own'（自分専用）/ 'shared'（共有）
+const hubLoadMine = () => {
+  try { const v = JSON.parse(localStorage.getItem(HUB_MINE_KEY));
+    return Array.isArray(v) ? v.filter(x => x && x.token && x.name) : []; } catch (e) { return []; }
+};
+const hubSaveMine = list => { try { localStorage.setItem(HUB_MINE_KEY, JSON.stringify(list)); } catch (e) {} };
+// 期限切れは「居ない人」として扱う（画面に出さない）
+const hubLive = list => (list || []).filter(x => !x.exp || x.exp > Date.now());
+const hubKind = () => { try { return localStorage.getItem(HUB_KIND_KEY) || ''; } catch (e) { return ''; } };
+const hubSetKind = k => { try { localStorage.setItem(HUB_KIND_KEY, k); } catch (e) {} };
+// 端末の名前（共有PC1 など）。管理者の端末一覧で「どのPCか」を読めるようにする。
+const HUB_LABEL_KEY = STOR + 'auth-label';
+const hubLabel = () => { try { return localStorage.getItem(HUB_LABEL_KEY) || ''; } catch (e) { return ''; } };
+const hubSetLabel = v => { try { localStorage.setItem(HUB_LABEL_KEY, String(v || '').slice(0, 40)); } catch (e) {} };
+// その人の利用証を通信に載せる。居なければ認証前（本来のキーだけ）に戻す。
+const hubUse = name => {
+  const live = hubLive(hubLoadMine());
+  // 共有端末として認証したPCでは、誰が操作していてもその端末の利用証を使う。
+  // 人ごとの利用証があればそちらを優先する（個人端末・共有PCに各自が登録した場合）。
+  const m = live.find(x => x.name === name) || live.find(x => x.isDevice) || null;
+  hubApplyToken(m ? m.token : '');
+  return m;
+};
+// この端末そのものが共有端末として認証されているか
+const hubIsDevice = () => hubLive(hubLoadMine()).some(x => x.isDevice);
+// 起動時：登録済みなら誰かの利用証を載せる（ログイン画面のデータ読み込みに要る）
+try { const _m = hubLive(hubLoadMine()); if (_m.length) hubApplyToken(_m[0].token); } catch (e) {}
+
+// 認証系のGAS呼び出し。応答を必ず読む（no-corsだと失敗が無言になるため使わない）。
+const hubAuthCall = async (action, params) => {
+  try {
+    const q = new URLSearchParams(Object.assign({ action, prefix: STOR, apiKey: GAS_API_KEY }, params || {}));
+    const r = await fetch(GAS_URL + '?' + q.toString(), { cache: 'no-store' });
+    const t = await r.text();
+    try { return JSON.parse(t); } catch (e) { return { ok: false, err: 'bad_response', raw: String(t).slice(0, 80) }; }
+  } catch (e) { return { ok: false, err: 'offline' }; }
+};
+// ログイン直後に呼ぶ。使った日から90日先へ期限を延ばす（延長が要らなければ何もしない）。
+const hubRenew = async name => {
+  const cur = hubLive(hubLoadMine()).find(x => x.name === name);
+  if (!cur) return;
+  hubApplyToken(cur.token);
+  const r = await hubAuthCall('authRenew');
+  if (!r || !r.ok) return;                       // 失敗しても通常利用は続けられる
+  const list = hubLoadMine().map(x => (x.name === name
+    ? Object.assign({}, x, r.token ? { token: r.token, exp: r.exp } : { exp: r.exp || x.exp }) : x));
+  hubSaveMine(list);
+  if (r.token) hubApplyToken(r.token);
+};
+
 // index側の全画面オーバーレイ（iframe）内で開かれているか。埋め込み時は
 // 「スケジュールに戻る」がページ遷移ではなく親へのpostMessage（オーバーレイ閉鎖）になる。
 const IS_EMBED=(()=>{try{return window.self!==window.top;}catch(e){return true;}})();
-const APP_VERSION='2.18'; // 表示用バージョン。更新ごとに上げる（軽微+0.01／大型は整数を上げる）。index_dev.htmlと揃える
+const APP_VERSION='2.32'; // 表示用バージョン。更新ごとに上げる（軽微+0.01／大型は整数を上げる）。index_dev.htmlと揃える
 const storKey=(base,sid)=>`${STOR}${sid}-${base}`;
 const CHUNK_SIZE=100;
 // ファイル名をGASキーに使える形に変換
@@ -576,6 +651,12 @@ const calcTokuten=(expiry,bookDate)=>{
   return'-';
 };
 
+// 特典欄の掃除：Excelの「特典」列に日付が入っていると（入庫日を隣の列に打った等）
+//   Dateがそのまま文字になって「Sun Nov 08 2026 00:00:00 GMT+0900」のように表示されてしまう。
+//   特典は「-」「①」「②」しか無いので、日付らしいものは「-」として扱う（2026-09-11）。
+const isDateLike=v=>v instanceof Date||/GMT[+-]\d|^\d{4}-\d{1,2}-\d{1,2}|^\d{1,2}\/\d{1,2}(\/\d{2,4})?$/.test(String(v==null?'':v).trim());
+const cleanTokuten=t=>{if(t==null||isDateLike(t))return'-';const x=String(t).trim();return x||'-';};
+
 // 受注日のDM列判定
 const calcDMCol=(dm1Date,dm2Date,bookDate)=>{
   if(!bookDate)return null;
@@ -719,7 +800,7 @@ const parseExcelFile=async(file)=>{
           const dm2Date=parseExcelDate(row[cDm2D>=0?cDm2D:null]);
           const dm2Book=parseExcelDate(row[cBook2f>=0?cBook2f:null]);
           const entryDate=parseExcelDate(row[cEntry>=0?cEntry:null]);
-          const tokRaw =String(row[cTok>=0?cTok:null]||'').trim();
+          const tokRaw =(()=>{const v=row[cTok>=0?cTok:null];return isDateLike(v)?'':String(v||'').trim();})(); // 日付が紛れていたら特典なし
           const courseRaw=(cCourse>=0?String(row[cCourse]||''):'').trim();
           const storeRaw=String(row[cStore>=0?cStore:null]||'').trim();
           const staff  =String(row[cStaff>=0?cStaff:null]||'').trim();
@@ -1168,7 +1249,7 @@ const BookingModal=({customer,inspData,loanerResH,loanerResS,loanerListH,loanerL
   const userStore=currentUser?.store?.id||currentUser?.store||'honten';
   const defaultStore=customer.store?normStore(customer.store):userStore;
   const defaultTokuten=(()=>{
-    if(customer.tokuten&&customer.tokuten!=='-')return customer.tokuten;
+    {const ct=cleanTokuten(customer.tokuten);if(ct!=='-')return ct;}  // 日付などの紛れ物は使わない
     if(customer.expiry){const today=new Date().toISOString().slice(0,10);return calcTokuten(customer.expiry,today);}
     return'-';
   })();
@@ -1614,9 +1695,9 @@ const CustomerRow=memo(({customer,onBook,onRevive,pending,flash})=>{
         )}
       </td>
       <td style={{padding:'7px 6px',verticalAlign:'middle',textAlign:'center'}}>
-        {customer.tokuten&&customer.tokuten!=='-'&&(
+        {cleanTokuten(customer.tokuten)!=='-'&&(
           <span style={{padding:'2px 7px',background:'#ede9fe',color:'#7c3aed',borderRadius:10,fontSize:11,fontWeight:700}}>
-            {customer.tokuten}
+            {cleanTokuten(customer.tokuten)}
           </span>
         )}
       </td>
@@ -1642,7 +1723,11 @@ const toDk=d=>{if(!d)return'';const p=String(d).split('-');return p.length===3?`
 const App=()=>{
   // index.htmlのlocalStorageからログインユーザーを取得
   const currentUser=useMemo(()=>{
-    try{const u=sessionStorage.getItem('hub_currentUser');return u?JSON.parse(u):null;}catch{return null;}
+    try{const u=sessionStorage.getItem('hub_currentUser');
+      const p=u?JSON.parse(u):null;
+      // スケジュール側でログインした人の利用証を、この画面の通信にも載せる
+      if(p&&p.name)hubUse(p.name);
+      return p;}catch{return null;}
   },[]);
   const [files,setFiles]=useState([]);
   const filesRef = useRef([]); // setFilesと同期して常に最新値を保持
@@ -1654,6 +1739,11 @@ const App=()=>{
   const [filterStatus,setFilterStatus]=useState('all');
   const [gasOk,setGasOk]=useState(null);
   const [gasLoading,setGasLoading]=useState(true);
+  // サーバーから本体をまだ読み終えていない顧客ファイルの数。0になるまで「読み込み中」を出し続ける。
+  // （以前は一覧(cf-index)を受け取った時点で案内を消していたため、ファイルが並ぶ前に
+  //   「インポートしてください」と出てしまい、読み込み済みなのに取り込み直す誤解を招いた）
+  const [cfPending,setCfPending]=useState(0);
+  const [cfIndexCount,setCfIndexCount]=useState(0);  // 一覧(cf-index)に載っているファイル数
   // 全画面表示（index_dev.htmlと同一の仕組み。sessionStorageのSTOR+'fs-restore'で
   // ページ間の全画面状態を引き継ぎ、遷移直後の最初のクリックで自動復帰する）
   const [isFullscreen,setIsFullscreen]=useState(false);
@@ -1667,6 +1757,7 @@ const App=()=>{
       const fs=!!(fsDoc.fullscreenElement||fsDoc.webkitFullscreenElement);
       setIsFullscreen(fs);
       if(!IS_EMBED&&!unloading){try{sessionStorage.setItem(STOR+'fs-restore',fs?'1':'0');}catch(e){}}
+      if(!fs&&!unloading){ try{ setTimeout(arm,0); }catch(e){} }   // 外れたら次の操作でまた入る（「元に戻す」なら arm が何もしない）
     };
     fsDoc.addEventListener('fullscreenchange',h);
     fsDoc.addEventListener('webkitfullscreenchange',h);
@@ -1675,18 +1766,31 @@ const App=()=>{
     // 全画面はページ遷移で必ず解除される。ブラウザ仕様上、遷移先で自動復帰はできず「ユーザー操作」が要る。
     // そこで最初の操作すべて（クリック・タッチ・スクロール・キー）で復帰させ、実質ワンアクションで全画面に戻す。
     let restore=null;
-    const RESTORE_EVENTS=['pointerdown','touchstart','keydown','wheel'];
-    try{
-      if(!IS_EMBED&&sessionStorage.getItem(STOR+'fs-restore')==='1'&&!(document.fullscreenElement||document.webkitFullscreenElement)){
-        restore=()=>{
-          RESTORE_EVENTS.forEach(ev=>document.removeEventListener(ev,restore,true));restore=null;
-          const el=document.documentElement;
-          const req=el.requestFullscreen||el.webkitRequestFullscreen;
-          if(req)Promise.resolve(req.call(el)).catch(()=>{});
-        };
-        RESTORE_EVENTS.forEach(ev=>document.addEventListener(ev,restore,true));
-      }
-    }catch(e){}
+    // 待ち受ける操作。ブラウザが「ユーザー操作」と認めるものは環境で違う（タッチでは pointerdown が
+    //   認められず touchend/click だけの場合がある）ので広めに取り、失敗したら次の操作でまた試す。
+    const RESTORE_EVENTS=['pointerdown','mousedown','pointerup','touchstart','touchend','click','keydown','wheel'];
+    // ★既定は全画面（index_dev.html と同じ規則・2026-09-12）。「元に戻す」を押した端末(fs-pref='off')だけ外す。
+    //   判定は fs-pref だけ（sessionStorage の fs-restore は見ない）。外れた時も次の操作でまた入る。
+    //   埋め込み（IS_EMBED）の時は親が全画面を持つので触らない。
+    const fsWanted=()=>{ try{ return (localStorage.getItem(STOR+'fs-pref2')||'on')!=='off'; }catch(e){ return true; } };
+    const arm=()=>{
+      if(IS_EMBED||restore)return;
+      if(document.fullscreenElement||document.webkitFullscreenElement)return;
+      if(!fsWanted())return;
+      restore=(ev)=>{
+        // 「全画面／元に戻す」ボタン上の操作はボタン自身に任せる。ここで先に全画面へ入れてしまうと、
+        //   直後の click がボタンを「元に戻す」と解釈して外し、fs-pref まで 'off' にしていた。
+        try{ if(ev&&ev.target&&ev.target.closest&&ev.target.closest('[data-fs-toggle]'))return; }catch(e){}
+        const el=document.documentElement;
+        const req=el.requestFullscreen||el.webkitRequestFullscreen;
+        if(!req)return;
+        RESTORE_EVENTS.forEach(ev2=>document.removeEventListener(ev2,restore,true));restore=null;
+        // スクロールや Esc は「ユーザー操作」と認められず失敗する。その時は待ち受けを付け直して次の操作で試す。
+        Promise.resolve(req.call(el)).catch(()=>{ setTimeout(arm,0); });
+      };
+      RESTORE_EVENTS.forEach(ev=>document.addEventListener(ev,restore,true));
+    };
+    try{ arm(); }catch(e){}
     return()=>{
       fsDoc.removeEventListener('fullscreenchange',h);
       fsDoc.removeEventListener('webkitfullscreenchange',h);
@@ -1699,9 +1803,11 @@ const App=()=>{
       let fsDoc=document,fsEl=document.documentElement;
       try{ if(IS_EMBED&&window.parent&&window.parent!==window){fsDoc=window.parent.document;fsEl=window.parent.document.documentElement;} }catch(e){}
       if(fsDoc.fullscreenElement||fsDoc.webkitFullscreenElement){
+        try{localStorage.setItem(STOR+'fs-pref2','off');}catch(e){}   // 自分で「元に戻す」を押した端末は、次からも全画面にしない
         const ex=fsDoc.exitFullscreen||fsDoc.webkitExitFullscreen;
         if(ex)Promise.resolve(ex.call(fsDoc)).catch(()=>{});
       }else{
+        try{localStorage.setItem(STOR+'fs-pref2','on');}catch(e){}
         const req=fsEl.requestFullscreen||fsEl.webkitRequestFullscreen;
         if(req)Promise.resolve(req.call(fsEl)).catch(()=>{});
       }
@@ -1846,9 +1952,12 @@ const App=()=>{
         if(Array.isArray(fileIndex)&&fileIndex.length>0){
           __lastCfIndex=fileIndex;
           localStorage.setItem(STOR+'cf-index',JSON.stringify(fileIndex));
+          setCfIndexCount(fileIndex.length);
+          let nPend=0;
           for(const fi of fileIndex){
             if(__saveCount>0)continue; // 書き込み中はGASからの上書きをスキップ
-            loadFileChunked(fi.name).then(f=>{
+            nPend++;
+            loadFileChunked(fi.name).finally(()=>setCfPending(n=>Math.max(0,n-1))).then(f=>{
               // ★一覧(cf-index)には載っているのに実体が読めない＝取り込み時にGASへ書けていない。
               //   黙って消えたように見えるのが一番まずいので、画面に出して再取り込みを促す。
               if(!f||f._complete===false){
@@ -1859,6 +1968,7 @@ const App=()=>{
               applyServerFile(f);
             });
           }
+          setCfPending(nPend);  // 読み終えるたびに1ずつ減る（上のfinally）
         }
         setGasLoading(false);
         setGasOk(true);
@@ -2825,7 +2935,7 @@ ${failed.length?failed.map(n=>'「'+n+'」').join('、'):'一覧の更新に失�
           <div style={{width:7,height:7,borderRadius:'50%',background:gasOk===true?'#4ade80':gasOk===false?'#f87171':'#fbbf24'}}/>
           <span style={{color:'rgba(255,255,255,.6)',fontSize:10}}>{gasOk===true?'GAS接続済':gasOk===false?'GAS接続エラー':'確認中'}</span>
         </div>
-        {<button onClick={toggleFullscreen} title={isFullscreen?'全画面を終了して元のウインドウに戻す':'全画面表示（ブラウザのタブ・お気に入りバーを隠して大きく表示）'}
+        {<button data-fs-toggle="1" onClick={toggleFullscreen} title={isFullscreen?'全画面を終了して元のウインドウに戻す':'全画面表示（ブラウザのタブ・お気に入りバーを隠して大きく表示）'}
           style={{display:'flex',alignItems:'center',gap:4,padding:'5px 10px',background:'rgba(255,255,255,0.15)',border:'2px solid rgba(255,255,255,0.5)',borderRadius:8,cursor:'pointer',fontWeight:700,fontSize:11,color:'white',whiteSpace:'nowrap'}}
           onMouseEnter={e=>e.currentTarget.style.background='rgba(255,255,255,0.3)'}
           onMouseLeave={e=>e.currentTarget.style.background='rgba(255,255,255,0.15)'}>
@@ -2882,7 +2992,13 @@ ${failed.length?failed.map(n=>'「'+n+'」').join('、'):'一覧の更新に失�
             opacity:importing?0.6:1}}>
           {importing?(importMsg||'読み込み中...'):'+ Excelインポート'}
         </button>
-        {bgSyncing&&(
+        {cfPending>0&&(
+          <span style={{display:'inline-flex',alignItems:'center',gap:5,marginLeft:8,marginBottom:3,
+            fontSize:11,color:'#b45309',fontWeight:800,flexShrink:0,whiteSpace:'nowrap'}}>
+            <span className="spinner-sm" style={{borderTopColor:'#d97706'}}/>読み込み中（あと{cfPending}ファイル）
+          </span>
+        )}
+        {bgSyncing&&cfPending===0&&(
           <span style={{display:'inline-flex',alignItems:'center',gap:5,marginLeft:8,marginBottom:3,
             fontSize:11,color:'#64748b',fontWeight:700,flexShrink:0,whiteSpace:'nowrap'}}>
             <span className="spinner-sm"/>同期中…
@@ -2914,13 +3030,23 @@ ${failed.length?failed.map(n=>'「'+n+'」').join('、'):'一覧の更新に失�
       )}
 
       {/* ファイルがない場合 */}
-      {gasLoading&&(
+      {(gasLoading||(files.length===0&&cfPending>0))&&(
         <div style={{flex:1,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:14,color:'#94a3b8'}}>
           <div className="spinner"/>
-          <div style={{fontSize:14,fontWeight:600}}>顧客ファイルを読み込んでいます...</div>
+          <div style={{fontSize:14,fontWeight:600}}>顧客ファイルを読み込んでいます...{cfPending>0?`（あと${cfPending}ファイル）`:''}</div>
+          <div style={{fontSize:12}}>すべて表示されるまでお待ちください（Excelインポートは不要です）</div>
         </div>
       )}
-      {!gasLoading&&files.length===0&&(
+      {/* キャッシュで一部だけ並んでいる間の帯。全ファイルが並んだら（残りは裏の更新だけ）出さない */}
+      {files.length>0&&cfPending>0&&files.length<cfIndexCount&&(
+        <div style={{flexShrink:0,margin:'6px 14px 0',padding:'7px 12px',borderRadius:8,
+          background:'#fffbeb',border:'1px solid #fcd34d',color:'#92400e',fontSize:12,fontWeight:700,
+          display:'flex',alignItems:'center',gap:8}}>
+          <span className="spinner-sm" style={{borderTopColor:'#d97706'}}/>
+          顧客ファイルを読み込んでいます（あと{cfPending}ファイル）。すべて表示されるまでお待ちください。Excelインポートは不要です。
+        </div>
+      )}
+      {!gasLoading&&files.length===0&&cfPending===0&&(
         <div style={{flex:1,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:16,color:'#94a3b8'}}>
           <div style={{fontSize:48}}>📂</div>
           <div style={{fontSize:16,fontWeight:600}}>Excelファイルをインポートしてください</div>

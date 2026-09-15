@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- fixed-holiday-1778028748861 force-deploy-1788442677051 -->
+<!-- fixed-holiday-1778028748861 force-deploy-1789450224570 -->
 <html lang="ja">
 <head>
   <meta charset="UTF-8" />
@@ -17,11 +17,16 @@
     // 開きっぱなしのタブが旧コードのまま動き続けるのを防ぐ。画面復帰時と定期に自分自身を
     // no-store+クエリ付きで取得し、__APP_BUILD が変わっていれば「更新」バナーを表示する。
     // 本番デプロイ時は port_to_main.js が __APP_BUILD を自動更新する（手動更新不要）。
-    window.__APP_BUILD='build-1788442677054';
+    window.__APP_BUILD='build-1789450224570';
     (function(){
       var RUNNING=window.__APP_BUILD, shown=false, checking=false;
+      function runningVer(){
+        try{ var s=document.querySelectorAll('script');   /* モバイルは変換結果を別scriptに入れ直すので、種類を問わず全部見る */
+          for(var i=0;i<s.length;i++){ var mm=s[i].textContent.match(/(?:APP_VERSION|MOBILE_VERSION)\s*=\s*'([^']+)'/); if(mm)return mm[1]; } }catch(e){}
+        return '';
+      }
       function banner(){
-        if(shown||!document.body)return; shown=true;
+        if(shown)return; if(!document.body){setTimeout(banner,500);return;} shown=true;   // 本文がまだ無い（CDNの読み込み待ち）なら少し待って出す。以前はここで諦めて帯が出なかった
         var b=document.createElement('div');
         b.textContent='🔄 新しいバージョンがあります（タップして更新）';
         b.style.cssText='position:fixed;left:0;right:0;bottom:0;z-index:2147483647;background:#1d4ed8;color:#fff;text-align:center;padding:14px 12px;font-weight:800;font-size:15px;cursor:pointer;box-shadow:0 -2px 12px rgba(0,0,0,.35)';
@@ -49,13 +54,16 @@
           if(res&&res.ok){
             var t=await res.text();
             var m=t.match(/__APP_BUILD='(build-\d+)'/);
-            if(m&&m[1]!==RUNNING)banner();
+            // ★ビルド識別子だけでなく、バージョン番号（APP_VERSION / MOBILE_VERSION）の違いでも出す。
+            //   識別子の更新を忘れると帯が出ず、スタッフが古い画面を使い続けていた（2026-09-12）。
+            var mv=t.match(/(?:APP_VERSION|MOBILE_VERSION)\s*=\s*'([^']+)'/), rv=runningVer();
+            if((m&&m[1]!==RUNNING)||(mv&&rv&&mv[1]!==rv))banner();
           }
         }catch(e){}
         checking=false;
       }
       document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible')check();});
-      setTimeout(check,30000);
+      setTimeout(check,8000);   // 開いてすぐ（8秒）に1回。古い画面のまま使い始めないように
       setInterval(check,15*60*1000);
     })();
   </script>
@@ -108,7 +116,13 @@
 const { useState, useEffect, useLayoutEffect, useRef, useCallback, memo, useMemo } = React;
 
 // ★ バージョン管理：アップデートのたびにここだけ変更する
-const APP_VERSION = '2.18';
+const APP_VERSION = '2.32';
+// 本人認証を必須にするか。false の間は従来どおり名前を選ぶだけで入れる（移行期間）。
+//   false … 全員が今までどおり使える。端末の登録（＋スタッフを追加）は先にできる。
+//   true  … その端末で本人確認を済ませた人しかログイン画面に出ない。
+// 全員の登録が済んでから true にし、あわせてGASの HUB_AUTH_ENFORCE_DEV を '1' にする。
+// 順番を逆にすると誰も入れなくなるので、必ず「登録 → true → GAS」の順で切り替えること。
+const AUTH_REQUIRED = false;
 
 
 
@@ -1941,19 +1955,102 @@ const notifyFailMail = async (detail, user)=>{
 //  STEP 5: 下記URLをGASデプロイ後のウェブアプリURLに書き換える
 // ===========================================================
 const GAS_URL = 'https://script.google.com/macros/s/AKfycbyNE1eVKjibSPLEA0HrVZI8NxEFKWQfMYQ6cKoM1Gznauy9AhfZqHzgs1zzMaxXnQ1_/exec';
-const GAS_API_KEY = 'hub2026co-f466kt5vs3vnDQDPuwWeS6XM';
+// ★利用者認証（v14以降・Kyoshi承認のBLOCK-B変更・2026-09-03）
+//   GASへの要求には apiKey を「本来のキー|利用証」の形で送る。GAS側は '|' の前だけを
+//   本来のキーとして照合し、後ろを利用証として検証する。
+//   こうすることで、既存の通信コード（3ファイル・22箇所）に一切手を入れずに
+//   利用証を全経路へ乗せられる。触るのは各ファイルこの1箇所だけ。
+const HUB_BASE_KEY = 'hub2026co-f466kt5vs3vnDQDPuwWeS6XM';
+let GAS_API_KEY = HUB_BASE_KEY;
+// 利用証を差し替える。空を渡せば認証前の状態（本来のキーだけ）に戻る。
+const hubApplyToken = t => { GAS_API_KEY = t ? (HUB_BASE_KEY + '|' + t) : HUB_BASE_KEY; };
+// 端末に保存した利用証を起動時に載せる。壊れていても読み飛ばして通常起動する。
+const HUB_TOKEN_KEY = STOR + 'auth-token';
+try {
+  const _t = localStorage.getItem(HUB_TOKEN_KEY);
+  if (_t) hubApplyToken(_t);
+} catch (e) {}
+
+// ★利用者認証の土台（v2.20 / 2026-09-04・Kyoshi承認のBLOCK-B変更）
+//   この端末で本人確認を済ませた人の「利用証」だけを持ち歩く。
+//   利用証は人ごと・端末ごとに1枚。使うたびに期限が90日先へ延びる（スライド式）ので、
+//   毎日使う人が締め出されることはない。3か月まったく開かれなかった端末だけが失効する。
+//   3ファイル（index_dev / customers / mobile）に同一のものを置くこと。
+const HUB_MINE_KEY = STOR + 'auth-mine';   // この端末の登録者 [{uid,name,myNumber,store,token,exp}]
+const HUB_KIND_KEY = STOR + 'auth-kind';   // 'own'（自分専用）/ 'shared'（共有）
+const hubLoadMine = () => {
+  try { const v = JSON.parse(localStorage.getItem(HUB_MINE_KEY));
+    return Array.isArray(v) ? v.filter(x => x && x.token && x.name) : []; } catch (e) { return []; }
+};
+const hubSaveMine = list => { try { localStorage.setItem(HUB_MINE_KEY, JSON.stringify(list)); } catch (e) {} };
+// 期限切れは「居ない人」として扱う（画面に出さない）
+const hubLive = list => (list || []).filter(x => !x.exp || x.exp > Date.now());
+const hubKind = () => { try { return localStorage.getItem(HUB_KIND_KEY) || ''; } catch (e) { return ''; } };
+const hubSetKind = k => { try { localStorage.setItem(HUB_KIND_KEY, k); } catch (e) {} };
+// 端末の名前（共有PC1 など）。管理者の端末一覧で「どのPCか」を読めるようにする。
+const HUB_LABEL_KEY = STOR + 'auth-label';
+const hubLabel = () => { try { return localStorage.getItem(HUB_LABEL_KEY) || ''; } catch (e) { return ''; } };
+const hubSetLabel = v => { try { localStorage.setItem(HUB_LABEL_KEY, String(v || '').slice(0, 40)); } catch (e) {} };
+// その人の利用証を通信に載せる。居なければ認証前（本来のキーだけ）に戻す。
+const hubUse = name => {
+  const live = hubLive(hubLoadMine());
+  // 共有端末として認証したPCでは、誰が操作していてもその端末の利用証を使う。
+  // 人ごとの利用証があればそちらを優先する（個人端末・共有PCに各自が登録した場合）。
+  const m = live.find(x => x.name === name) || live.find(x => x.isDevice) || null;
+  hubApplyToken(m ? m.token : '');
+  return m;
+};
+// この端末そのものが共有端末として認証されているか
+const hubIsDevice = () => hubLive(hubLoadMine()).some(x => x.isDevice);
+// 起動時：登録済みなら誰かの利用証を載せる（ログイン画面のデータ読み込みに要る）
+try { const _m = hubLive(hubLoadMine()); if (_m.length) hubApplyToken(_m[0].token); } catch (e) {}
+
+// 認証系のGAS呼び出し。応答を必ず読む（no-corsだと失敗が無言になるため使わない）。
+const hubAuthCall = async (action, params) => {
+  try {
+    const q = new URLSearchParams(Object.assign({ action, prefix: STOR, apiKey: GAS_API_KEY }, params || {}));
+    const r = await fetch(GAS_URL + '?' + q.toString(), { cache: 'no-store' });
+    const t = await r.text();
+    try { return JSON.parse(t); } catch (e) { return { ok: false, err: 'bad_response', raw: String(t).slice(0, 80) }; }
+  } catch (e) { return { ok: false, err: 'offline' }; }
+};
+// ログイン直後に呼ぶ。使った日から90日先へ期限を延ばす（延長が要らなければ何もしない）。
+const hubRenew = async name => {
+  const cur = hubLive(hubLoadMine()).find(x => x.name === name);
+  if (!cur) return;
+  hubApplyToken(cur.token);
+  const r = await hubAuthCall('authRenew');
+  if (!r || !r.ok) return;                       // 失敗しても通常利用は続けられる
+  const list = hubLoadMine().map(x => (x.name === name
+    ? Object.assign({}, x, r.token ? { token: r.token, exp: r.exp } : { exp: r.exp || x.exp }) : x));
+  hubSaveMine(list);
+  if (r.token) hubApplyToken(r.token);
+};
 
 const GAS_READY = GAS_URL !== 'YOUR_GAS_URL_HERE' && GAS_URL !== '';
 
-// 復旧（過去の時点に戻す）を実行できる人。全データ上書きの危険操作のため名指しで限定。
-// uid か 氏名 のどちらか一致で許可（スタッフ再登録でuidが変わっても氏名で拾う）。
-const RESTORE_ALLOWED = [
-  {uid:'h0',  name:'見取勇一'},
-  {uid:'h1',  name:'見取大介'},
-  {uid:'s10', name:'藤原昭人'},
-  {uid:'h7',  name:'江川京志'},
-];
-const canRestore = (u) => !!u && RESTORE_ALLOWED.some(a => (u.uid && a.uid===u.uid) || (u.name && a.name===u.name));
+// ★管理者の判定（v2.20・2026-09-11）
+//   以前はここに4人の名前を直書きしていた。管理者コンソールの名簿と別物になり、
+//   片方を変えても片方が変わらないので、コンソールの名簿（GASの HUB_ADMIN_EMAILS）に一本化した。
+//   起動時に名前一覧を取り、以後は名前で判定する。個人端末では利用証の印でも判定できる。
+//   ★共有端末では誰が座っているか分からないので、誰であっても管理者扱いにしない。
+//     管理者の作業は、自分の端末か管理者コンソールから行う。
+let HUB_ADMIN_NAMES = null;   // null=未取得。取得できるまでは利用証の印だけで判定する
+const hubLoadAdminNames = async () => {
+  try {
+    const r = await hubAuthCall('authAdminNames');
+    if (r && r.ok && Array.isArray(r.names)) HUB_ADMIN_NAMES = r.names;
+  } catch (e) {}
+};
+const canRestore = (u) => {
+  if (!u || !u.name) return false;
+  if (hubIsDevice()) return false;                       // 共有端末では管理者の操作を出さない
+  const cert = hubLive(hubLoadMine()).find(x => x.name === u.name);
+  if (cert && cert.isAdmin) return true;                 // 自分の端末で管理者として認証済み
+  return Array.isArray(HUB_ADMIN_NAMES) && HUB_ADMIN_NAMES.indexOf(u.name) >= 0;
+};
+// 名簿は起動時に1回だけ取る（60秒待たずに描けるよう、結果は後から効く）
+try { hubLoadAdminNames(); } catch (e) {}
 
 // GASからデータを読み込む
 // ★サーバーに繋がっているかの目印。読み取りに失敗した時に画面を空のまま描くと
@@ -2300,9 +2397,12 @@ const GCSS=`
   .slide-in{animation:slideIn 0.2s ease both;}
   .fade-in{animation:fadeIn 0.18s ease both;}
   *{box-sizing:border-box;} input,select,textarea,button{font-family:inherit;}
-  ::-webkit-scrollbar{width:6px;height:6px}
+  /* スクロールバーは太めに。細いとマウスで掴みにくい（ユーザー要望・2026-09-11） */
+  ::-webkit-scrollbar{width:14px;height:12px}
   ::-webkit-scrollbar-track{background:#f1f5f9}
-  ::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:3px}
+  ::-webkit-scrollbar-thumb{background:#a8b3c2;border-radius:8px;border:3px solid #f1f5f9}
+  ::-webkit-scrollbar-thumb:hover{background:#7b8798}
+  *{scrollbar-width:auto}
   /* 代車管理など横スクロールを掴みやすくする太めバー（クリックしやすいよう約2倍） */
   .fat-hscroll{scrollbar-width:auto;}
   .fat-hscroll::-webkit-scrollbar{height:14px;width:14px}
@@ -2511,6 +2611,18 @@ const StaffSettingsModal=memo(({isOpen,onClose,staffListH,staffListS,onUpdate,on
   const [deskName,setDeskName]=useState('');
   const [deskStore,setDeskStore]=useState('honten');
   const [deskConfirmDel,setDeskConfirmDel]=useState(null);
+  // 本人認証まわり
+  const [editEmail,setEditEmail]=useState('');
+  const [inviteBusy,setInviteBusy]=useState(false);
+  const [inviteMsg,setInviteMsg]=useState('');
+  const [devices,setDevices]=useState(null);   // 端末台帳（null=未読込）
+  const [devBusy,setDevBusy]=useState(false);
+  const loadDevices=useCallback(async()=>{
+    setDevBusy(true);
+    const v=await sGet(STOR+'auth-devices');
+    setDevices((v&&typeof v==='object'&&!Array.isArray(v))?v:{});
+    setDevBusy(false);
+  },[]);
 
   useEffect(()=>{
     if(!isOpen)return;
@@ -2535,6 +2647,7 @@ const StaffSettingsModal=memo(({isOpen,onClose,staffListH,staffListS,onUpdate,on
 
   const selectStaff=(s)=>{
     setSelUid(s.uid);setEditName(s.name);setEditBadge(s.badge||'mechanic');setEditNumber(s.myNumber);setConfirmDel(false);
+    setEditEmail(s.loginEmail||'');setInviteMsg('');
     setEditCaps(s.capabilities||getDefaultCapabilities(s.badge||'mechanic'));
     setEditStore(s.store||'honten');
   };
@@ -2545,7 +2658,8 @@ const StaffSettingsModal=memo(({isOpen,onClose,staffListH,staffListS,onUpdate,on
     if(!target)return;
     // 番号重複チェック（自分以外）
     if(allStaff.some(s=>s.uid!==selUid&&s.myNumber===editNumber)){alert('そのマイナンバーはすでに使用されています');return;}
-    onUpdate({...target,name:editName.trim(),badge:editBadge,myNumber:editNumber,capabilities:editCaps,store:editStore});
+    onUpdate({...target,name:editName.trim(),badge:editBadge,myNumber:editNumber,capabilities:editCaps,store:editStore,
+      loginEmail:editEmail.trim().toLowerCase()||undefined});
     setSelUid(null);
   };
 
@@ -2600,9 +2714,17 @@ const StaffSettingsModal=memo(({isOpen,onClose,staffListH,staffListS,onUpdate,on
                   style={{flex:1,padding:'9px 4px',border:'none',background:tab==='desktop'?'#f0fdf4':'#f9fafb',color:tab==='desktop'?'#16a34a':'#6b7280',fontWeight:tab==='desktop'?800:500,fontSize:12,cursor:'pointer',borderBottom:tab==='desktop'?'3px solid #16a34a':'3px solid transparent',transition:'all 0.1s'}}>
                   🖥️ 共有
                 </button>
+                <button onClick={()=>{setTab('devices');setSelUid(null);if(devices===null)loadDevices();}}
+                  style={{flex:1,padding:'9px 4px',border:'none',background:tab==='devices'?'#fff7ed':'#f9fafb',color:tab==='devices'?'#c2410c':'#6b7280',fontWeight:tab==='devices'?800:500,fontSize:12,cursor:'pointer',borderBottom:tab==='devices'?'3px solid #c2410c':'3px solid transparent',transition:'all 0.1s'}}>
+                  🔑 端末
+                </button>
               </div>
 
-              {tab==='desktop'?(
+              {tab==='devices'?(
+                <div style={{overflowY:'auto',flex:1,padding:'14px 12px',fontSize:11.5,color:'#6b7280',lineHeight:1.8}}>
+                  右側に、本人確認を済ませた端末の一覧が出ます。
+                </div>
+              ):tab==='desktop'?(
                 <div style={{overflowY:'auto',flex:1,padding:'10px 8px',display:'flex',flexDirection:'column',gap:10}}>
                   {/* 本店 */}
                   <div style={{fontSize:11,fontWeight:800,color:'#1d4ed8',marginBottom:2}}>本店</div>
@@ -2662,7 +2784,76 @@ const StaffSettingsModal=memo(({isOpen,onClose,staffListH,staffListS,onUpdate,on
 
             {/* 右：編集フォーム */}
             <div style={{flex:1,overflowY:'auto',padding:'16px 18px'}}>
-              {tab==='desktop'?(
+              {tab==='devices'?(
+                <div style={{display:'flex',flexDirection:'column',gap:14}}>
+                  <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:8}}>
+                    <div style={{fontWeight:800,fontSize:14,color:'#c2410c'}}>🔑 本人確認を済ませた端末</div>
+                    <button onClick={loadDevices} disabled={devBusy}
+                      style={{padding:'5px 12px',borderRadius:7,border:'2px solid #cbd5e1',background:'white',fontWeight:700,fontSize:11,color:'#475569',cursor:'pointer'}}>
+                      {devBusy?'読込中…':'再読込'}
+                    </button>
+                  </div>
+                  <div style={{fontSize:11.5,color:'#6b7280',lineHeight:1.8}}>
+                    紛失・退職のときは<b>「取り消し」</b>を押してください。押した瞬間からその端末は使えなくなります。<br/>
+                    「失効予定」は<b>最後に使った日から90日後</b>です。使うたびに先へ延びるので、毎日使う端末がここで切れることはありません。
+                    3か月まったく開かれなかった端末だけが自動で消えます。
+                  </div>
+                  {devices===null?(
+                    <div style={{padding:'20px 0',textAlign:'center',color:'#9ca3af',fontSize:12}}>読み込み中…</div>
+                  ):Object.keys(devices).length===0?(
+                    <div style={{padding:'18px 14px',background:'#f9fafb',border:'1.5px solid #e5e7eb',borderRadius:10,color:'#6b7280',fontSize:12,lineHeight:1.8}}>
+                      まだ登録された端末はありません。<br/>
+                      スタッフのログイン用メールを登録し、「招待メールを送る」を押してください。
+                    </div>
+                  ):(
+                    <div style={{display:'flex',flexDirection:'column',gap:7}}>
+                      {Object.keys(devices).map(j=>{
+                        const d=devices[j]||{};
+                        const exp=Number(d.exp)||0;
+                        const dead=exp>0&&exp<=Date.now();
+                        const fmt=ms=>{const t=new Date(ms);return t.getFullYear()+'/'+(t.getMonth()+1)+'/'+t.getDate();};
+                        return(
+                          <div key={j} style={{display:'flex',alignItems:'center',gap:9,padding:'9px 11px',borderRadius:9,
+                            background:dead?'#f9fafb':'#fff7ed',border:'1.5px solid '+(dead?'#e5e7eb':'#fed7aa')}}>
+                            <div style={{flex:1,minWidth:0}}>
+                              <div style={{fontWeight:800,fontSize:13,color:dead?'#9ca3af':'#9a3412'}}>
+                                {d.n||'（不明）'} <span style={{fontWeight:500,fontSize:11}}>No.{d.m}</span>
+                              </div>
+                              <div style={{fontSize:10.5,color:'#6b7280',marginTop:2}}>
+                                登録 {d.at?fmt(d.at):'—'}
+                                {d.last?(' ／ 最後に使った日 '+fmt(d.last)):''}
+                                {' ／ '}{dead?<b style={{color:'#dc2626'}}>失効済み</b>:('失効予定 '+(exp?fmt(exp):'—'))}
+                              </div>
+                              {d.ua&&<div style={{fontSize:9.5,color:'#b6bec8',marginTop:2,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{d.ua}</div>}
+                            </div>
+                            <button onClick={async()=>{
+                              if(!window.confirm((d.n||'この端末')+' の登録を取り消しますか？\n\nこの端末はすぐ使えなくなります。\n本人が使い続ける場合は、もう一度メールで登録し直してもらってください。'))return;
+                              // 画面の一覧ではなくサーバー最新を土台にして、対象の1件だけを消す。
+                              // 開いている間に他の人が登録した端末を巻き添えで消さないため。
+                              setDevBusy(true);
+                              const latest=await sGet(STOR+'auth-devices');
+                              const base=(latest&&typeof latest==='object'&&!Array.isArray(latest))?latest:null;
+                              if(!base){
+                                setDevBusy(false);
+                                alert('取り消せませんでした。サーバーから最新の一覧を読めていません。\n通信の状態を確かめて、もう一度お試しください。');
+                                return;
+                              }
+                              const next=Object.assign({},base); delete next[j];
+                              const r=await sSet(STOR+'auth-devices',next);
+                              setDevBusy(false);
+                              if(!r){alert('取り消せませんでした。もう一度お試しください。');}
+                              loadDevices();
+                            }}
+                              style={{padding:'6px 11px',borderRadius:7,border:'2px solid #fca5a5',background:'white',color:'#dc2626',fontWeight:800,fontSize:11,cursor:'pointer',flexShrink:0}}>
+                              取り消し
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              ):tab==='desktop'?(
                 <div style={{display:'flex',flexDirection:'column',gap:16}}>
                   <div style={{fontWeight:800,fontSize:14,color:'#15803d'}}>🖥️ 共有デスクトップ端末を追加</div>
                   <div style={{fontSize:12,color:'#6b7280',lineHeight:1.7}}>
@@ -2765,6 +2956,44 @@ const StaffSettingsModal=memo(({isOpen,onClose,staffListH,staffListS,onUpdate,on
                       onBlur={e=>e.target.style.borderColor='#e5e7eb'}/>
                   </div>
 
+                  {/* ログイン用メール（本人認証） */}
+                  <div>
+                    <div style={{fontWeight:700,fontSize:12,color:'#374151',marginBottom:6}}>🔑 ログイン用メール</div>
+                    <input value={editEmail} onChange={e=>{setEditEmail(e.target.value);setInviteMsg('');}}
+                      type="email" autoComplete="off" placeholder="例：daisuke@gmail.com"
+                      style={{width:'100%',padding:'9px 11px',border:'2px solid #e5e7eb',borderRadius:8,fontSize:14,outline:'none',boxSizing:'border-box'}}
+                      onFocus={e=>e.target.style.borderColor='#c2410c'}
+                      onBlur={e=>e.target.style.borderColor='#e5e7eb'}/>
+                    <div style={{fontSize:11,color:'#6b7280',marginTop:5,lineHeight:1.7}}>
+                      このアドレスの持ち主だけがログインできます。空欄の人はログインできません。<br/>
+                      <b>アドレスを入れて「✓ 変更を保存」を押してから</b>、下の招待を送ってください。
+                    </div>
+                    <button
+                      disabled={inviteBusy||!(selectedStaff&&selectedStaff.loginEmail)}
+                      onClick={async()=>{
+                        const mail=selectedStaff&&selectedStaff.loginEmail;
+                        if(!mail)return;
+                        // 打ち間違いは本人には「何も届かない」としか見えず原因が分からない。
+                        // 送る前に必ずアドレスを読み合わせてもらう。
+                        if(!window.confirm('このアドレスに招待メールを送ります。\n\n    '+mail+'\n\n宛先に間違いはありませんか？'))return;
+                        setInviteBusy(true);setInviteMsg('');
+                        const r=await hubAuthCall('authInvite',{email:mail});
+                        setInviteBusy(false);
+                        setInviteMsg(r&&r.ok ? '送信しました（'+mail+'）'
+                          : r&&r.err==='not_registered' ? '送れません：先に「更新」を押してアドレスを保存してください。'
+                          : r&&r.err==='too_many' ? '送信が続いています。しばらく待ってからお試しください。'
+                          : '送信に失敗しました。通信の状態をご確認ください。');
+                      }}
+                      style={{width:'100%',marginTop:8,padding:'9px 0',borderRadius:8,cursor:(selectedStaff&&selectedStaff.loginEmail)?'pointer':'default',
+                        border:'2px solid '+((selectedStaff&&selectedStaff.loginEmail)?'#0284c7':'#e5e7eb'),
+                        background:(selectedStaff&&selectedStaff.loginEmail)?'#f0f9ff':'#f9fafb',
+                        color:(selectedStaff&&selectedStaff.loginEmail)?'#0369a1':'#9ca3af',fontWeight:800,fontSize:13}}>
+                      {inviteBusy?'送信中…':'✉️ 招待メールを送る'}
+                    </button>
+                    {inviteMsg&&<div style={{fontSize:12,fontWeight:700,marginTop:6,
+                      color:inviteMsg.indexOf('送信しました')===0?'#15803d':'#dc2626'}}>{inviteMsg}</div>}
+                  </div>
+
                   {/* バッジ */}
                   <div>
                     <div style={{fontWeight:700,fontSize:12,color:'#374151',marginBottom:6}}>🏅 業務バッジ</div>
@@ -2853,7 +3082,306 @@ const StaffSettingsModal=memo(({isOpen,onClose,staffListH,staffListS,onUpdate,on
 // ============================================
 //  ログイン
 // ============================================
-const LoginScreen=({onLogin,staffListH,staffListS,onRegister,onSettings,desktopListH,desktopListS,initialDesktop})=>{
+// ============================================
+//  本人認証：この端末にスタッフを追加する
+//    メールを入れる → (最初の1人だけ)端末の種類を選ぶ → 届いた6桁を入れる
+//    氏名とナンバーは入力させない（自己申告だと他人を名乗れるため）。
+//    サーバーが登録済みメールから本人を確定して返す。
+// ============================================
+// 招待メールのリンクに付いている印（?inv=…）。開くだけで誰の登録か伝わるので、
+// アドレスを打つ段を飛ばして6桁の入力から始める（ユーザー指摘 2026-09-15）。
+// 登録が済んだら（やめた時も）URLから印を外す。残すと開き直すたびに登録画面が出る。
+const HUB_INVITE_ID=(()=>{try{return new URLSearchParams(location.search).get('inv')||'';}catch(e){return '';}})();
+const hubDropInvite=()=>{ if(!HUB_INVITE_ID)return; try{history.replaceState(null,'',location.pathname+location.hash);}catch(e){} };
+const AuthAddScreen=({onDone,onCancel})=>{
+  const [inv,setInv]=useState(HUB_INVITE_ID);   // 招待リンクの印。これがあればアドレスは要らない
+  const [step,setStep]=useState(HUB_INVITE_ID?'code':'email');   // email → code → kind → done（招待リンクからは code から）
+  const [email,setEmail]=useState('');
+  const [code,setCode]=useState('');
+  const [kind,setKind]=useState(hubKind());
+  const [busy,setBusy]=useState(false);
+  const [err,setErr]=useState('');
+  const [who,setWho]=useState(null);
+  const [pend,setPend]=useState(null);
+  const [fromInvite,setFromInvite]=useState(!!HUB_INVITE_ID);   // 招待メールの6桁を使う   // 本人確認は済んだが、端末の種類がまだの人
+  const [label,setLabel]=useState(hubLabel());   // この端末の名前（共有のときだけ聞く）
+  const [devNames,setDevNames]=useState(null);   // 管理者が決めた端末名の候補
+  const [typing,setTyping]=useState(false);      // 候補を使わず自分で入力する
+  const [plan,setPlan]=useState([]);             // 管理者が決めた「使う端末」
+  const firstOnDevice = hubLive(hubLoadMine()).length===0;
+
+  // 印から来た人が「アドレスを入れて進む」を選んだ時。以後は印を使わない
+  const useEmailInstead=(msg)=>{ setInv(''); setFromInvite(false); setCode(''); setErr(msg||''); setStep('email'); };
+  const sendCode=async(mail,resend)=>{
+    const target=String(mail||email).trim();
+    setErr('');setBusy(true);
+    // 印があってアドレスが無ければ、印で送る（サーバーが印からアドレスを引く）
+    const who=(!target&&inv)?{inv}:{email:target};
+    const r=await hubAuthCall('authRequest',Object.assign(who,resend?{resend:'1'}:{}));
+    setBusy(false);
+    // すでに招待メールに6桁が書いてある場合は、送り直さずそれを使ってもらう
+    if(r&&r.ok) setFromInvite(!!r.existing);
+    if(r&&r.err==='bad_invite'){ useEmailInstead('この招待リンクは期限切れです。メールアドレスを入れて、新しいコードを受け取ってください。'); return; }
+    if(!r||!r.ok){
+      setStep('email');
+      setErr(r&&r.err==='not_registered'
+        ? 'このアドレスは登録されていません。管理者にご確認ください。'
+        : r&&r.err==='too_many' ? '送信が続いています。しばらく待ってからお試しください。'
+        : r&&r.err==='bad_email' ? 'メールアドレスの形式が正しくありません。'
+        : 'コードを送れませんでした。通信の状態をご確認ください。');
+      return;
+    }
+    setStep('code');
+  };
+  const startSend=()=>{
+    if(email.trim().indexOf('@')<1){setErr('メールアドレスの形式が正しくありません。');return;}
+    sendCode();
+  };
+  // 利用証を端末に保存して完了。端末の種類と名前はここで確定する。
+  const finish=(r,k,lb)=>{
+    hubDropInvite();
+    hubSetKind(k);
+    if(lb) hubSetLabel(lb);
+    const list=hubLoadMine().filter(x=>x.name!==r.name);
+    list.push({uid:r.uid||'',name:r.name,myNumber:r.myNumber,store:r.store||'honten',
+               token:r.token,exp:r.exp,isDevice:!!r.device,isAdmin:!!r.admin});
+    hubSaveMine(list);
+    // 2人目が入った端末は「共有」に直す（自分専用のままだと他人の名義で予約が入る）
+    if(hubLive(hubLoadMine()).filter(x=>!x.isDevice).length>1 && hubKind()==='own') hubSetKind('shared');
+    // 管理者の端末一覧で読めるように、種類と名前をサーバーへ記録する
+    hubApplyToken(r.token);
+    hubAuthCall('authLabel',{kind:hubKind()||k,label:hubLabel()||lb||''});
+    setWho(r);setStep('done');
+  };
+  // 共有の端末は、最初に登録する人が1回だけ名前を付ける
+  const needLabel=k=>k==='shared'&&!hubLabel();
+  // 管理者がその人に決めた「使う端末」を引く。決まっていれば本人は何も選ばない。
+  const planOf=async r=>{
+    try{
+      const store=(r&&r.store)==='sanda'?'sanda':'honten';
+      const list=await sGet(STOR+store+'-staff-v2');
+      const me=(Array.isArray(list)?list:[]).find(x=>x&&((r.uid&&x.uid===r.uid)||x.name===r.name));
+      return (me&&Array.isArray(me.devPlan))?me.devPlan.filter(Boolean):[];
+    }catch(e){ return []; }
+  };
+  // 管理者が決めた端末名を読む（無くても止まらない。その場で入力できる）
+  useEffect(()=>{
+    if(step!=='label'||devNames!==null)return;
+    (async()=>{
+      const v=await sGet(STOR+'auth-devnames');
+      const list=Array.isArray(v)?v.filter(x=>x&&x.name):[];
+      setDevNames(list); setTyping(list.length===0);
+    })();
+  },[step,devNames]);
+  const pickKind=k=>{ setKind(k); if(needLabel(k)){setStep('label');return;} finish(pend,k,''); };
+  const verify=async()=>{
+    setErr('');setBusy(true);
+    // 印があってアドレスが無ければ印で照合する（招待リンクから開いた人）
+    const who=(!email.trim()&&inv)?{inv}:{email:email.trim()};
+    // この端末が持っている利用証も送る＝同じ人の前の登録を置き換える（台帳に行を増やさない）
+    const vq=Object.assign({code:code.trim(),ua:navigator.userAgent||'',prev:hubLoadMine().map(x=>x&&x.token).filter(Boolean).slice(0,6).join(',')},who);
+    let r=await hubAuthCall('authVerify',vq);
+    // ★返事が届かなかった（回線・サーバーの混雑）時は、3秒おいて自動でもう一度確かめる。
+    //   サーバーは成功の返事を15分覚えているので、登録が済んでいれば同じ利用証が返る（二重登録にならない）。
+    if(!r||r.err==='offline'||r.err==='bad_response'){
+      setErr('サーバーの返事を待っています。もう一度確かめます…');
+      await new Promise(res=>setTimeout(res,3000));
+      r=await hubAuthCall('authVerify',vq);
+    }
+    setBusy(false);
+    if(r&&r.err==='bad_invite'){ useEmailInstead('この招待リンクは期限切れです。メールアドレスを入れて、新しいコードを受け取ってください。'); return; }
+    if(!r||!r.ok){
+      setErr(r&&r.err==='bad_code' ? 'コードが違います。もう一度お試しください。'
+        : r&&r.err==='expired' ? 'このコードは期限切れか、すでに使われています。「コードを送り直す」で新しいコードを受け取ってください。'
+        : r&&(r.err==='too_many'||r.err==='too_many_tries') ? '入力の失敗が続いたため止めました。送り直してください。'
+        : r&&r.err==='busy' ? 'サーバーが混み合っています。少し待ってから、もう一度「確認する」を押してください。'
+        : 'サーバーの返事を受け取れませんでした。少し待ってから、同じコードでもう一度「確認する」を押してください。');
+      return;
+    }
+    // ★共有端末そのもののアドレスで認証した場合。人ではないので、
+    //   その端末を「共有端末」として登録し、以後は担当者を選んで使う。
+    if(r.device){ finish(r,'shared',r.label||r.name||''); return; }
+    // 管理者が決めた「使う端末」に従う。1つだけなら本人は何も選ばない。
+    // ★端末の状態より先に見る。管理者の指定があるなら、それが答え。
+    const plan=await planOf(r);
+    if(plan.length===1){
+      const one=plan[0];
+      finish(r, one==='own'?'own':'shared', one==='own'?'':one);
+      return;
+    }
+    if(plan.length>1){ setPend(r); setPlan(plan); setStep('plan'); return; }
+    // 管理者が決めていない場合は、これまでどおり自分で選ぶ
+    if(firstOnDevice && !kind){ setPend(r); setStep('kind'); return; }
+    const already=hubLive(hubLoadMine()).length>0;
+    const finalKind=(already&&(kind||hubKind())==='own')?'shared':(kind||hubKind()||'shared');
+    if(needLabel(finalKind)){ setPend(r); setKind(finalKind); setStep('label'); return; }
+    finish(r, finalKind, '');
+  };
+
+  const BOX={background:'white',borderRadius:18,padding:'28px 30px',maxWidth:430,width:'100%',boxShadow:'0 30px 80px rgba(0,0,0,0.4)'};
+  const IN={width:'100%',padding:'11px 13px',border:'2px solid #e5e7eb',borderRadius:9,fontSize:15,outline:'none',boxSizing:'border-box'};
+  const BTN=(on)=>({width:'100%',padding:'13px 0',background:on?'linear-gradient(135deg,#c2410c,#f97316)':'#e5e7eb',
+    color:on?'white':'#9ca3af',border:'none',borderRadius:11,fontWeight:800,fontSize:15,cursor:on?'pointer':'default',marginTop:14});
+  const SUB={width:'100%',padding:'10px 0',background:'#f8fafc',border:'2px solid #cbd5e1',borderRadius:9,
+    fontWeight:700,fontSize:13,color:'#475569',cursor:'pointer',marginTop:9};
+  const ERR=err?<div style={{color:'#dc2626',fontWeight:700,fontSize:12.5,marginTop:8}}>{err}</div>:null;
+  const CARD={width:'100%',textAlign:'left',padding:'13px 15px',borderRadius:10,border:'2px solid #cbd5e1',background:'white',cursor:'pointer'};
+
+  return(
+    <div style={{position:'fixed',inset:0,background:'linear-gradient(140deg,#1e3a8a,#1d4ed8,#2563eb)',display:'flex',
+      alignItems:'flex-start',justifyContent:'center',fontFamily:'system-ui,sans-serif',padding:'28px 16px',overflowY:'auto',zIndex:10001}}>
+      <div style={BOX}>
+        <div style={{textAlign:'center',marginBottom:18}}>
+          <div style={{fontSize:38,marginBottom:4}}>🔑</div>
+          <div style={{fontWeight:900,fontSize:17,color:'#111827'}}>この端末にスタッフを追加</div>
+          <div style={{fontSize:12,color:'#6b7280',marginTop:3}}>登録は端末ごとに1回だけです</div>
+        </div>
+
+        {step==='email'&&(
+          <div>
+            <div style={{fontSize:12.5,color:'#4b5563',lineHeight:1.8,marginBottom:12}}>
+              招待メールが届いた<b>ご自分のメールアドレス</b>を入れてください。<br/>
+              名前や番号の入力は要りません。
+            </div>
+            <input type="email" value={email} onChange={e=>setEmail(e.target.value)} style={IN}
+              placeholder="ここにメールアドレスを入力" autoComplete="off" inputMode="email"
+              onKeyDown={e=>{if(e.key==='Enter')startSend();}}/>
+            {ERR}
+            <button style={BTN(!busy&&email.trim().length>0)} disabled={busy||!email.trim()} onClick={startSend}>
+              {busy?'確認中…':'次へ'}
+            </button>
+            {onCancel&&<button style={SUB} onClick={()=>{hubDropInvite();onCancel();}}>やめる</button>}
+          </div>
+        )}
+
+        {step==='kind'&&(
+          <div>
+            <div style={{fontWeight:800,fontSize:15,color:'#111827',marginBottom:3}}>
+              {pend&&pend.name} さん、確認できました
+            </div>
+            <div style={{fontSize:12,color:'#6b7280',marginBottom:12}}>
+              最後にひとつだけ。<b>この端末はどちらですか？</b><br/>
+              最初に登録する人が1回選ぶだけです。あとから変えられます。
+            </div>
+            <button onClick={()=>pickKind('shared')} style={{...CARD,marginBottom:9}}>
+              <div style={{fontWeight:800,fontSize:14,color:'#111827'}}>みんなで使う（共有）</div>
+              <div style={{fontSize:11.5,color:'#6b7280',marginTop:2}}>店のPCなど。使う前に名前を選びます。<b>迷ったらこちら。</b></div>
+            </button>
+            <button onClick={()=>pickKind('own')} style={CARD}>
+              <div style={{fontWeight:800,fontSize:14,color:'#111827'}}>自分専用</div>
+              <div style={{fontSize:11.5,color:'#6b7280',marginTop:2}}>自分のスマホ、個人に割り当てたPC。開くだけで使えます。</div>
+            </button>
+            <div style={{fontSize:11.5,color:'#9ca3af',marginTop:11,lineHeight:1.7}}>
+              他の人も使う端末で「自分専用」を選ぶと、その人の名義で予約が入ってしまいます。
+            </div>
+            <button style={SUB} onClick={()=>{setPend(null);setStep('email');setCode('');}}>← やり直す</button>
+          </div>
+        )}
+
+        {step==='plan'&&(
+          <div>
+            <div style={{fontWeight:800,fontSize:15,color:'#111827',marginBottom:3}}>
+              {pend&&pend.name} さん、確認できました
+            </div>
+            <div style={{fontSize:12,color:'#6b7280',marginBottom:12}}>
+              いま使っているのはどちらの端末ですか？
+            </div>
+            <div style={{display:'grid',gap:8}}>
+              {plan.map(x=>(
+                <button key={x} onClick={()=>finish(pend,x==='own'?'own':'shared',x==='own'?'':x)}
+                  style={{...CARD,padding:'13px 15px'}}>
+                  <b style={{fontSize:14.5,color:'#111827'}}>{x==='own'?'個人端末':x}</b>
+                  <div style={{fontSize:11.5,color:'#6b7280',marginTop:2}}>
+                    {x==='own'?'自分のスマホ、自分だけが使うPC':'店のPC・タブレット'}
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {step==='label'&&(
+          <div>
+            <div style={{fontWeight:800,fontSize:15,color:'#111827',marginBottom:3}}>この端末はどれですか？</div>
+            <div style={{fontSize:12,color:'#6b7280',marginBottom:12}}>
+              みんなで使う端末なので、あとで管理者が見分けられるように名前が要ります。
+            </div>
+            {devNames===null&&<p style={{fontSize:12.5,color:'#9ca3af'}}>読み込んでいます…</p>}
+            {devNames!==null&&!typing&&(<>
+              <div style={{display:'grid',gap:8}}>
+                {devNames.map(d=>(
+                  <button key={d.name} onClick={()=>finish(pend,kind||'shared',d.name)}
+                    style={{...CARD,padding:'12px 14px'}}>
+                    <b style={{fontSize:14.5,color:'#111827'}}>{d.name}</b>
+                    <span style={{fontSize:11.5,color:'#6b7280',marginLeft:8}}>
+                      {d.store==='sanda'?'三田店':'本店'}
+                    </span>
+                  </button>
+                ))}
+              </div>
+              <button style={SUB} onClick={()=>setTyping(true)}>一覧にない（自分で入力する）</button>
+            </>)}
+            {devNames!==null&&typing&&(<>
+              <input type="text" value={label} onChange={e=>setLabel(e.target.value.slice(0,40))} style={IN}
+                placeholder="共有PC1" autoComplete="off" autoFocus
+                onKeyDown={e=>{if(e.key==='Enter'&&label.trim())finish(pend,kind||'shared',label.trim());}}/>
+              <button style={BTN(!!label.trim())} disabled={!label.trim()}
+                onClick={()=>finish(pend,kind||'shared',label.trim())}>登録する</button>
+              {devNames.length>0&&<button style={SUB} onClick={()=>setTyping(false)}>← 一覧から選ぶ</button>}
+            </>)}
+            <p style={{fontSize:11.5,color:'#9ca3af',marginTop:11,lineHeight:1.7}}>
+              名前は端末に1つだけです。2人目からは聞かれません。
+            </p>
+          </div>
+        )}
+
+        {step==='code'&&(
+          <div>
+            <div style={{fontWeight:800,fontSize:15,color:'#111827',marginBottom:3}}>
+              {fromInvite?'招待メールに書かれた6桁を入れてください':'6桁のコードを入れてください'}</div>
+            <div style={{fontSize:12,color:'#6b7280',marginBottom:12}}>
+              {fromInvite
+                ? <>届いている<b>招待メール</b>の「確認コード」の6桁です。</>
+                : <>{email.trim()||'招待メールのアドレス'} 宛に新しい6桁を送りました（24時間以内に入力してください）</>}
+            </div>
+            <input type="text" value={code} onChange={e=>setCode(e.target.value.replace(/[^0-9]/g,'').slice(0,6))}
+              style={{...IN,fontSize:26,letterSpacing:'0.4em',textAlign:'center',fontWeight:800}}
+              placeholder="------" inputMode="numeric" autoComplete="one-time-code" autoFocus
+              onKeyDown={e=>{if(e.key==='Enter'&&code.length===6)verify();}}/>
+            {ERR}
+            <button style={BTN(!busy&&code.length===6)} disabled={busy||code.length!==6} onClick={verify}>
+              {busy?'確認中…':'確認する'}
+            </button>
+            <button style={SUB} onClick={()=>useEmailInstead('')}>{inv?'メールアドレスを入れて進む':'← アドレスを入れ直す'}</button>
+            <button style={{...SUB,marginTop:6}} disabled={busy}
+              onClick={()=>{setCode('');sendCode(email,true);}}>
+              メールが見つからない → コードを送り直す
+            </button>
+          </div>
+        )}
+
+        {step==='done'&&(
+          <div>
+            <div style={{background:'#ecfdf5',border:'2px solid #10b981',borderRadius:11,padding:'16px 14px',textAlign:'center'}}>
+              <div style={{fontSize:30,marginBottom:4}}>✅</div>
+              <div style={{fontWeight:900,fontSize:17,color:'#065f46'}}>{who&&who.name} さん</div>
+              <div style={{fontSize:12,color:'#047857',marginTop:3}}>
+                この端末に登録しました（{hubKind()==='own'?'自分専用':'共有'}）
+              </div>
+            </div>
+            <div style={{fontSize:12,color:'#6b7280',lineHeight:1.8,marginTop:12}}>
+              次からは、この端末を開くだけで使えます。<br/>
+              使っているうちは登録が切れることはありません。
+            </div>
+            <button style={BTN(true)} onClick={()=>onDone&&onDone(who)}>はじめる →</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+const LoginScreen=({onLogin,staffListH,staffListS,onRegister,onSettings,desktopListH,desktopListS,initialDesktop,onAddAuth,deviceName,deviceStore,authOn,onMakeOwn})=>{
   const [sel,setSel]=useState(null);
   // タイムアウト後（initialDesktopあり）はすぐスタッフ選択画面を表示
   const [deskSel,setDeskSel]=useState(()=>{
@@ -2950,6 +3478,25 @@ const LoginScreen=({onLogin,staffListH,staffListS,onRegister,onSettings,desktopL
           <p style={{fontSize:12,color:'#6b7280',marginTop:4}}>統合管理システム</p>
           <span style={{display:'inline-block',marginTop:6,padding:'2px 10px',borderRadius:20,background:'#eff6ff',border:'1px solid #bfdbfe',color:'#1d4ed8',fontSize:11,fontWeight:700}}>v{APP_VERSION}</span>
         </div>
+        {/* 認証済みの共有端末。どのPCで作業しているかを掲げ、
+            その中から担当者を選ぶ形にする（インデックスカードの見立て）。 */}
+        {deviceName&&(
+          <div style={{marginBottom:18}}>
+            <div style={{display:'inline-flex',alignItems:'center',gap:6,padding:'6px 16px 5px',
+              background:'#1e3a34',color:'white',borderRadius:'10px 10px 0 0',fontWeight:800,fontSize:13,
+              letterSpacing:'.02em',boxShadow:'0 -1px 0 rgba(0,0,0,.08)'}}>
+              <span style={{fontSize:15}}>🖥️</span>{deviceName}
+            </div>
+            <div style={{border:'2px solid #1e3a34',borderRadius:'0 12px 12px 12px',
+              padding:'12px 15px',background:'#f4f8f6'}}>
+              <div style={{fontSize:12.5,color:'#31544c',lineHeight:1.8}}>
+                このPCは<b>共有端末として登録済み</b>です
+                {deviceStore?`（${deviceStore}）`:''}。<br/>
+                下から<b>担当者を選ぶだけ</b>で使えます。追加の登録は要りません。
+              </div>
+            </div>
+          </div>
+        )}
         {/* 社長エリア（0番・本店・三田店の枠外上部） */}
         {(()=>{
           const allStaff=[...(staffListH||[]),...(staffListS||[])];
@@ -2973,39 +3520,60 @@ const LoginScreen=({onLogin,staffListH,staffListS,onRegister,onSettings,desktopL
             </div>
           );
         })()}
-        <div style={{display:'flex',gap:14,marginBottom:16}}>
-          <StorePanel store={STORES[0]} staffList={staffListH}/>
-          <StorePanel store={STORES[1]} staffList={staffListS}/>
-        </div>
-        {/* 共有デスクトップ端末 */}
-        {((desktopListH||[]).length>0||(desktopListS||[]).length>0)&&(
-          <div style={{marginBottom:16}}>
-            <div style={{fontSize:12,fontWeight:700,color:'#6b7280',marginBottom:8,display:'flex',alignItems:'center',gap:6}}>
-              🖥️ 共有端末 <span style={{fontWeight:400,color:'#9ca3af'}}>（タップ後にスタッフを選びます）</span>
+        {/* 端末が三田店にあるなら三田店を左に。自分の店を探す手間を無くす。 */}
+        {(() => {
+          const sanda = deviceStore === '三田店';
+          const first  = sanda ? {st:STORES[1], list:staffListS} : {st:STORES[0], list:staffListH};
+          const second = sanda ? {st:STORES[0], list:staffListH} : {st:STORES[1], list:staffListS};
+          return (
+            <div style={{display:'flex',gap:14,marginBottom:16}}>
+              <StorePanel store={first.st}  staffList={first.list}/>
+              <StorePanel store={second.st} staffList={second.list}/>
             </div>
-            <div style={{display:'flex',flexWrap:'wrap',gap:8}}>
-              {[...(desktopListH||[]).map(d=>({...d,store:'honten'})),...(desktopListS||[]).map(d=>({...d,store:'sanda'}))].map(d=>{
-                const st=STORES.find(s=>s.id===d.store)||STORES[0];
-                return(
-                  <button key={d.uid} onClick={()=>{setDeskSel(d);setSel(null);}}
-                    style={{padding:'10px 18px',borderRadius:10,border:`2px solid ${st.color}55`,background:st.bg,color:st.color,fontWeight:700,fontSize:13,cursor:'pointer',display:'flex',alignItems:'center',gap:8,transition:'all 0.12s'}}>
-                    <span style={{fontSize:18}}>🖥️</span>
-                    <div style={{textAlign:'left'}}>
-                      <div style={{fontWeight:800}}>{d.name}</div>
-                      <div style={{fontSize:10,opacity:0.7}}>{st.name}</div>
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-        )}
+          );
+        })()}
+        {/* 旧「共有端末タイル」は廃止。端末そのものをメールで認証する方式に置き換えた。
+            タイルは選ばずに名前を直接押せば素通りできてしまい、共有PCの設定が意味を
+            持たなかったため（2026-09-09、ユーザー指摘）。 */}
         <button
-          onClick={()=>{if(sel)onLogin({...sel.staff,id:sel.staff.myNumber,store:sel.store});}}
+          onClick={()=>{if(sel)onLogin({...sel.staff,id:sel.staff.myNumber,store:sel.store,
+            ...(deviceName?{desktopName:deviceName}:{})});}}
           disabled={!sel}
           style={{width:'100%',padding:'14px 0',background:sel?`linear-gradient(135deg,${sel.store.color},${sel.store.accent})`:'#e5e7eb',color:sel?'white':'#9ca3af',border:'none',borderRadius:12,fontWeight:800,fontSize:16,cursor:sel?'pointer':'default',transition:'all 0.2s',marginBottom:10}}>
           {sel?`【${sel.store.name}】${sel.staff.name} でログイン →`:'担当者を選択してください'}
         </button>
+        {/* 登録者が1人だけの端末で、種類が「自分専用」になっていないとき。
+            自分しか使わない端末なら、ここで切り替えれば次から開くだけで入れる。 */}
+        {onMakeOwn&&(
+          <div style={{marginBottom:10,padding:'10px 13px',background:'#eff6ff',border:'1px solid #bfdbfe',borderRadius:10}}>
+            <div style={{fontSize:12,color:'#1e40af',lineHeight:1.7,marginBottom:7}}>
+              この端末は<b>共有</b>として登録されています。
+              ご自分しか使わない端末なら、<b>自分専用</b>に切り替えると次から開くだけで入れます。
+            </div>
+            <button onClick={onMakeOwn}
+              style={{width:'100%',padding:'9px 0',background:'white',border:'2px solid #93c5fd',borderRadius:9,
+                fontWeight:800,fontSize:13,color:'#1d4ed8',cursor:'pointer'}}>
+              この端末を自分専用にする
+            </button>
+          </div>
+        )}
+        {onAddAuth&&(
+          <div style={{marginBottom:10,padding:'10px 13px',background:'#fff7ed',border:'1px solid #fed7aa',borderRadius:10}}>
+            <div style={{fontSize:12,color:'#9a3412',lineHeight:1.7,marginBottom:7}}>
+              {((staffListH||[]).length+(staffListS||[]).length===0)
+                ? <b>この端末には、まだ誰も登録されていません。</b>
+                : authOn
+                  ? <span>この端末で本人確認を済ませた方が並んでいます。</span>
+                  : <span>いまは移行期間のため、<b>全員が並んでいます</b>。</span>}
+              {' '}この端末をお使いの方は、下のボタンから登録してください（1回だけ）。
+            </div>
+            <button onClick={onAddAuth}
+              style={{width:'100%',padding:'9px 0',background:'white',border:'2px dashed #f97316',borderRadius:9,
+                fontWeight:800,fontSize:13,color:'#c2410c',cursor:'pointer'}}>
+              ＋ スタッフを追加（メールで本人確認）
+            </button>
+          </div>
+        )}
         <div style={{display:'flex',gap:8}}>
           <button onClick={onSettings}
             style={{flex:1,padding:'10px 18px',background:'#f8fafc',border:'2px solid #94a3b8',borderRadius:10,fontWeight:700,fontSize:13,color:'#475569',cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center',gap:5,transition:'all 0.12s'}}
@@ -3568,7 +4136,7 @@ const RestrictionModal=memo(({isOpen,onClose,dateLabel,dk,restriction,onSave})=>
 // ============================================
 //  スタッフ休日・有給カレンダーモーダル
 // ============================================
-const StaffCalendarModal=memo(({isOpen,onClose,initMonth,currentUser,
+const StaffCalendarModal=memo(({isOpen,onClose,initMonth,currentUser,adminMode,
   dynStaffH,dynStaffS,
   dayOffDataH,setDayOffDataH,dayOffDataS,setDayOffDataS,
   paidLeaveDataH,setPaidLeaveDataH,paidLeaveDataS,setPaidLeaveDataS,
@@ -3622,6 +4190,8 @@ const StaffCalendarModal=memo(({isOpen,onClose,initMonth,currentUser,
 
   const handleDayClick=(dkk,year,month,day)=>{
     if(!selStaff)return;
+    // 一般スタッフは自分の休日しか触れない（画面で絞っているが、念のためここでも）
+    if(!adminMode && selStaff!==(currentUser&&currentUser.name))return;
     if(isStoreClosed(year,month,day))return; // 店休日は操作不可
     if(selType==='dayoff'){
       const cur=dayOffData[dkk]||[];
@@ -3700,13 +4270,16 @@ const StaffCalendarModal=memo(({isOpen,onClose,initMonth,currentUser,
           </div>
           <div style={{display:'flex',alignItems:'center',gap:6,flexWrap:'wrap',marginBottom:selStaff?8:0}}>
             <span style={{fontSize:11,fontWeight:700,color:'#374151',flexShrink:0}}>スタッフ：</span>
+            {!adminMode&&<span style={{fontSize:10.5,color:'#9ca3af'}}>（ご自分の休日だけ設定できます）</span>}
             <button onClick={()=>setSelStaff(null)}
               style={{padding:'4px 10px',borderRadius:6,border:`2px solid ${!selStaff?'#6366f1':'#d1d5db'}`,
                 background:!selStaff?'#eef2ff':'white',color:!selStaff?'#c2410c':'#6b7280',
                 fontWeight:!selStaff?700:500,fontSize:11,cursor:'pointer'}}>
               全員表示
             </button>
-            {staffList.map(s=>{
+            {/* 一般スタッフは自分の名前だけ。他人の休日は管理者が設定する（決定①）。
+                「全員表示」は残すので、他人の休みを見ることはできる。 */}
+            {(adminMode?staffList:staffList.filter(s=>s.name===(currentUser&&currentUser.name))).map(s=>{
               const hasDayoff=Object.values(dayOffData).some(arr=>arr.includes(s.name));
               const hasLeave=Object.values(pleaveData).some(arr=>arr.includes(s.name));
               return(
@@ -6276,7 +6849,7 @@ const LoanerGrid=memo(({loanerRes,loanerMonth,setLoanerMonth,onDeleteRes,onRepla
     <div>
       {/* ヘッダー */}
       <div style={{display:'flex',alignItems:'center',gap:12,marginBottom:6,flexWrap:'wrap',flexShrink:0}}>
-        <button onClick={onBack} style={BACK_S}><ChevronLeft size={16}/>{pickMode?'予約カードに戻る':'カレンダーへ'}</button>
+        <button onClick={onBack} style={BACK_S}><ChevronLeft size={16}/>{pickMode?'予約カードに戻る':'スケジュールに戻る'}</button>
         <h2 style={{fontSize:18,fontWeight:800,color:'#7c2d12',margin:0}}>
           🚗 代車管理
           {!pickMode&&<span style={{fontSize:12,color:'#6b7280',marginLeft:8,fontWeight:500}}>（閲覧専用）</span>}
@@ -7180,6 +7753,24 @@ function AppInner() {
     }catch{}
   },[]);
 
+  // ── 本人認証：この端末に登録された人 ──
+  const [authMine,setAuthMine]=useState(()=>hubLive(hubLoadMine()));
+  const [showAuthAdd,setShowAuthAdd]=useState(!!HUB_INVITE_ID);   // 招待リンクから開いたら最初から登録画面
+  // 自分でログアウトした直後は、自動ログインを止めてログイン画面を出す。
+  // 止めないと押した瞬間に入り直してしまい、交代も「＋スタッフを追加」もできない。
+  const [authAutoOff,setAuthAutoOff]=useState(false);
+  // 自動ログインの判定はスタッフ表が届いてから決まる。それまでログイン画面を描くと
+  // 一瞬だけ見えてしまうので、判定中は何も描かない。長く待たされないよう5秒で諦める。
+  const [autoGaveUp,setAutoGaveUp]=useState(false);
+  const _autoPending=!currentUser&&!authAutoOff&&!autoGaveUp
+    &&hubKind()==='own'&&authMine.length===1&&!authMine[0].isDevice;
+  useEffect(()=>{
+    if(!_autoPending)return;
+    const t=setTimeout(()=>setAutoGaveUp(true),5000);
+    return()=>clearTimeout(t);
+  },[_autoPending]);
+  const refreshAuthMine=useCallback(()=>{setAuthMine(hubLive(hubLoadMine()));},[]);
+
   // ── 共有PC：10分無操作でスタッフ選択画面に戻る ──
   const _idleTimer = useRef(null);
   const _idleDesktop = useRef(null); // タイムアウト時に戻る共有PC情報
@@ -7272,6 +7863,9 @@ function AppInner() {
       const fs=!!(document.fullscreenElement||document.webkitFullscreenElement);
       setIsFullscreen(fs);
       if(!unloading){try{sessionStorage.setItem(STOR+'fs-restore',fs?'1':'0');}catch(e){}}
+      // 外れた（Esc など）。「元に戻す」で外したのでなければ、次の操作でまた全画面に入れるようにする。
+      //   ページを閉じる途中（unloading）は何もしない。
+      if(!fs&&!unloading){ try{ setTimeout(arm,0); }catch(e){} }
     };
     document.addEventListener('fullscreenchange',h);
     document.addEventListener('webkitfullscreenchange',h);
@@ -7279,18 +7873,33 @@ function AppInner() {
     // 全画面はページ遷移で必ず解除される。ブラウザ仕様上、遷移先で自動復帰はできず「ユーザー操作」が要る。
     // そこで最初の操作すべて（クリック・タッチ・スクロール・キー）で復帰させ、実質ワンアクションで全画面に戻す。
     let restore=null;
-    const RESTORE_EVENTS=['pointerdown','touchstart','keydown','wheel'];
-    try{
-      if(sessionStorage.getItem(STOR+'fs-restore')==='1'&&!(document.fullscreenElement||document.webkitFullscreenElement)){
-        restore=()=>{
-          RESTORE_EVENTS.forEach(ev=>document.removeEventListener(ev,restore,true));restore=null;
-          const el=document.documentElement;
-          const req=el.requestFullscreen||el.webkitRequestFullscreen;
-          if(req)Promise.resolve(req.call(el)).catch(()=>{});
-        };
-        RESTORE_EVENTS.forEach(ev=>document.addEventListener(ev,restore,true));
-      }
-    }catch(e){}
+    // 待ち受ける操作。ブラウザが「ユーザー操作」と認めるものは環境で違う（タッチでは pointerdown が
+    //   認められず touchend/click だけの場合がある）ので広めに取り、失敗したら次の操作でまた試す。
+    const RESTORE_EVENTS=['pointerdown','mousedown','pointerup','touchstart','touchend','click','keydown','wheel'];
+    // ★既定は全画面（ユーザー指示・2026-09-12）。「元に戻す」を押して全画面をやめた記録
+    //   （localStorage fs-pref='off'）が無ければ、次の操作（クリック・タッチ・キー・スクロール）で全画面に入る。
+    //   判定は fs-pref だけ。sessionStorage の fs-restore は見ない（Esc や閉じる時にも '0' が書かれ、
+    //   再読み込み・タブ復元で残るため、それを見ていると2回目以降に入らなかった＝2026-09-12 ユーザー報告）。
+    //   Esc などで外れた時も、「元に戻す」を押したのでなければ次の操作でまた入る（下の h から arm を呼ぶ）。
+    const fsWanted=()=>{ try{ return (localStorage.getItem(STOR+'fs-pref2')||'on')!=='off'; }catch(e){ return true; } };
+    const arm=()=>{
+      if(restore)return;
+      if(document.fullscreenElement||document.webkitFullscreenElement)return;
+      if(!fsWanted())return;
+      restore=(ev)=>{
+        // 「全画面／元に戻す」ボタン上の操作はボタン自身に任せる。ここで先に全画面へ入れてしまうと、
+        //   直後の click がボタンを「元に戻す」と解釈して外し、fs-pref まで 'off' にしていた。
+        try{ if(ev&&ev.target&&ev.target.closest&&ev.target.closest('[data-fs-toggle]'))return; }catch(e){}
+        const el=document.documentElement;
+        const req=el.requestFullscreen||el.webkitRequestFullscreen;
+        if(!req)return;
+        RESTORE_EVENTS.forEach(ev2=>document.removeEventListener(ev2,restore,true));restore=null;
+        // スクロールや Esc は「ユーザー操作」と認められず失敗する。その時は待ち受けを付け直して次の操作で試す。
+        Promise.resolve(req.call(el)).catch(()=>{ setTimeout(arm,0); });
+      };
+      RESTORE_EVENTS.forEach(ev=>document.addEventListener(ev,restore,true));
+    };
+    try{ arm(); }catch(e){}
     return()=>{
       document.removeEventListener('fullscreenchange',h);
       document.removeEventListener('webkitfullscreenchange',h);
@@ -7301,9 +7910,11 @@ function AppInner() {
   const toggleFullscreen=useCallback(()=>{
     try{
       if(document.fullscreenElement||document.webkitFullscreenElement){
+        try{localStorage.setItem(STOR+'fs-pref2','off');}catch(e){}   // 自分で「元に戻す」を押した端末は、次からも全画面にしない
         const ex=document.exitFullscreen||document.webkitExitFullscreen;
         if(ex)Promise.resolve(ex.call(document)).catch(()=>{});
       }else{
+        try{localStorage.setItem(STOR+'fs-pref2','on');}catch(e){}
         const el=document.documentElement;
         const req=el.requestFullscreen||el.webkitRequestFullscreen;
         if(req)Promise.resolve(req.call(el)).catch(()=>{});
@@ -8243,7 +8854,17 @@ function AppInner() {
     setModalData(data);
     // 既存データにレンタカー情報があれば復元（編集時の再表示用）
     const savedRentalId=data.rentalCarId??null;
-    const savedRentalRec=savedRentalId?{id:'restored',carId:savedRentalId}:null;
+    // ★本物のレンタカー予約(rres)を bookingKey（無ければ氏名）で探して持つ。
+    //   以前は {id:'restored'} という中身の無い仮の記録を持たせていたため、この予約を開いて
+    //   保存し直すと、保存処理が「同じ予約に紐づく古いレンタカーを消して置き直す」際に
+    //   本物（貸出期間つき）を消して仮の記録に置き換えていた。代車管理からは期間の無い記録は
+    //   見えないので「レンタカーが消えた」ように見える（2026-09-12、長崎様のレンタカーD）。
+    //   同じ理由で、モーダルの「削除」も仮の id では本物を消せていなかった。
+    //   本物が見つからない時だけ仮の記録にし、保存時は rres を触らない（下の保存処理を参照）。
+    const _rBk0=type==='insp'?`insp-${dk}-${idx||0}`:`sched-${dk}-${slot||''}`;
+    const _rRecs=savedRentalId?Object.values(_resObj(rresRef.current)[savedRentalId]||{}).filter(r=>r&&r.id!=='restored'):[];
+    const _rReal=_rRecs.find(r=>r.bookingKey===_rBk0)||_rRecs.find(r=>r.user&&data.name&&r.user===data.name&&!r.bookingKey);
+    const savedRentalRec=savedRentalId?(_rReal?{..._rReal}:{id:'restored',carId:savedRentalId}):null;
     setPendingLoanerId(null);
     setPendingRentalId(savedRentalId);
     setPendingRentalRec(savedRentalRec);
@@ -8605,7 +9226,9 @@ function AppInner() {
         :`sched-${_dcTargetDk}-${modalSlot||''}`;
       const _rRec={...pendingRentalRec,bookingKey:_rBk,carId:pendingRentalId};
       const _rCar=pendingRentalId;
-      setTimeout(()=>persistRres(
+      // ★中身の無い仮の記録（id:'restored'＝本物が見つからなかった時）は書かない。
+      //   書くと本物を消して期間の無い記録に置き換えてしまう。ラベルだけ予約カードに残す。
+      if(_rRec.id!=='restored')setTimeout(()=>persistRres(
         base=>putResRec(removeResByBk(base,[_rBk]),_rCar,String(_rRec.id),_rRec),
         back=>resHasRec(back,_rCar,_rRec.id),
         {verb:'登録',name:_rRec.user}
@@ -9332,7 +9955,12 @@ function AppInner() {
 
   const handleLoanerBack=useCallback(()=>{
     if(pickMode){setPickMode(false);setModalData(savedModalData||(modalType==='insp'?blankInsp():blankSched()));if(selDate)setView('schedule');else setView('calendar');setModalOpen(true);}
-    else setView('calendar');
+    else{
+      // 「スケジュールに戻る」は文字どおりスケジュール画面へ（以前はカレンダーに戻っていた・2026-09-12）。
+      // 日付が未選択なら今日を選ぶ（顧客リストから戻るときと同じ扱い）。
+      setSelDate(d=>{if(d)return d;const n=new Date();return new Date(n.getFullYear(),n.getMonth(),n.getDate());});
+      setView('schedule');
+    }
   },[pickMode,savedModalData,modalType,selDate]);
 
   // スタッフ登録・更新ハンドラ
@@ -9368,6 +9996,22 @@ function AppInner() {
     if(store==='honten') setDesktopListH(p=>(p||[]).filter(d=>d.uid!==uid));
     else setDesktopListS(p=>(p||[]).filter(d=>d.uid!==uid));
   },[setDesktopListH,setDesktopListS]);
+
+  // ── 自分専用の端末は、ログイン画面を出さずにそのまま使えるようにする ──
+  //   共有PCでは必ず名前を選ばせる（前の人の名義で予約が入るのを防ぐため）。
+  //   ★このフックはログイン判定より前に置くこと（下の注意書きと同じ理由）。
+  useEffect(()=>{
+    if(currentUser||authAutoOff)return;   // 移行期間でも自動ログインする
+    if(hubKind()!=='own'||authMine.length!==1)return;
+    const m=authMine[0];
+    if(m.isDevice)return;          // 共有端末は必ず担当者を選ばせる
+    const rec=[...(dynStaffH||[]),...(dynStaffS||[])].find(x=>(m.uid&&x.uid===m.uid)||x.name===m.name);
+    if(!rec)return;                     // スタッフ表から消えた人は入れない
+    const store=STORES.find(x=>x.id===(rec.store||m.store))||STORES[0];
+    hubUse(m.name); hubRenew(m.name);
+    setCurrentUserPersist({...rec,id:rec.myNumber,store});
+    setViewStore(store.id); setView('schedule');
+  },[currentUser,authMine,authAutoOff,dynStaffH,dynStaffS,setCurrentUserPersist]);
 
   // タイムスケジュールを現在時刻に自動追従スクロール（今日を表示中のみ・現在の1枠前を先頭に）。
   // ★フックは必ずログイン判定(if(!currentUser)return)より前に置くこと（後ろに置くと
@@ -9425,12 +10069,51 @@ function AppInner() {
     return()=>{clearInterval(initIv);clearInterval(iv);document.removeEventListener('visibilitychange',onVis);};
   },[currentUser,view,selDate,schedCollapsed]);
 
+  // 自動ログインの判定中は、ログイン画面を一瞬でも見せない（開いた瞬間に一瞬出るのを防ぐ）
+  if(!currentUser&&_autoPending)return(
+    <>
+      <style>{GCSS}</style>
+      <div style={{position:'fixed',inset:0,background:'linear-gradient(140deg,#1e3a8a,#1d4ed8,#2563eb)'}}/>
+    </>
+  );
+  // 本人認証：この端末に誰も登録されていなければ、まず登録してもらう
+  if(!currentUser&&(showAuthAdd||(AUTH_REQUIRED&&authMine.length===0)))return(
+    <>
+      <style>{GCSS}</style>
+      <AuthAddScreen
+        onCancel={(authMine.length>0||!AUTH_REQUIRED)?()=>setShowAuthAdd(false):null}
+        onDone={()=>{setShowAuthAdd(false);refreshAuthMine();}}/>
+    </>
+  );
+  // AUTH_REQUIRED の間は、この端末で本人確認を済ませた人しかログイン画面に出さない
+  // この端末そのものが共有端末として認証されていれば、操作する人は全員選べる。
+  // 端末の側が認証済みなので、人ごとの登録は要らない（店のPCの使い方に合う）。
+  const _devCert=authMine.some(m=>m.isDevice);
+  const _authNames=new Set(authMine.map(m=>m.name));
+  const _pick=(list)=>!AUTH_REQUIRED?list
+    :_devCert?(list||[]).filter(x=>!x.noLogin)
+    :(list||[]).filter(x=>_authNames.has(x.name));
+  // 「＋ スタッフを追加」は、共有端末として認証済みのPCでは出さない。
+  // 端末そのものが認証済みで、承認済みのスタッフは全員並ぶため、個別の登録は不要。
+  // 個人端末では、2人目を足せるように残す。
+  const _needEnrol=!authMine.some(m=>m.isDevice);
+  // 認証済みの共有端末なら、その端末名を掲げる
+  const _devMine=authMine.find(m=>m.isDevice)||null;
+  const _devName=_devMine?_devMine.name:'';
+  const _devStore=_devMine?(_devMine.store==='sanda'?'三田店':'本店'):'';
+  const _loginH=_pick(dynStaffH);
+  const _loginS=_pick(dynStaffS);
   if(!currentUser)return(
     <>
       <style>{GCSS}</style>
       <LoginScreen
-        onLogin={u=>{setCurrentUserPersist(u);setViewStore(u.store?.id||'honten');setView('schedule');setTimeout(()=>window.scrollTo({top:0,behavior:'instant'}),50);}}
-        staffListH={dynStaffH} staffListS={dynStaffS}
+        onLogin={u=>{hubUse(u.name);hubRenew(u.name);setCurrentUserPersist(u);setViewStore(u.store?.id||'honten');setView('schedule');setTimeout(()=>window.scrollTo({top:0,behavior:'instant'}),50);}}
+        onAddAuth={_needEnrol?()=>setShowAuthAdd(true):null}
+        deviceName={_devName} deviceStore={_devStore} authOn={AUTH_REQUIRED}
+        onMakeOwn={(authMine.length===1&&!authMine[0].isDevice&&hubKind()!=='own')
+          ?()=>{hubSetKind('own');setAuthAutoOff(false);refreshAuthMine();}:null}
+
+        staffListH={_loginH} staffListS={_loginS}
         desktopListH={desktopListH} desktopListS={desktopListS}
         onRegister={()=>setShowStaffRegister(true)}
         onSettings={()=>setShowStaffSettings(true)}
@@ -9496,7 +10179,7 @@ function AppInner() {
 
               </div>
               <div style={{display:'flex',alignItems:'center',gap:5}}>
-                <button onClick={toggleFullscreen} title={isFullscreen?'全画面を終了して元のウインドウに戻す':'全画面表示（ブラウザのタブ・お気に入りバーを隠して大きく表示）'}
+                <button data-fs-toggle="1" onClick={toggleFullscreen} title={isFullscreen?'全画面を終了して元のウインドウに戻す':'全画面表示（ブラウザのタブ・お気に入りバーを隠して大きく表示）'}
                   style={{display:'flex',alignItems:'center',gap:4,padding:'5px 10px',background:'rgba(255,255,255,0.18)',border:'2px solid rgba(255,255,255,0.55)',borderRadius:8,cursor:'pointer',fontWeight:700,fontSize:11,color:'white',whiteSpace:'nowrap'}}
                   onMouseEnter={e=>e.currentTarget.style.background='rgba(255,255,255,0.32)'}
                   onMouseLeave={e=>e.currentTarget.style.background='rgba(255,255,255,0.18)'}>
@@ -9506,21 +10189,23 @@ function AppInner() {
                   <span style={{width:22,height:22,borderRadius:'50%',background:userStore.color,color:'white',display:'flex',alignItems:'center',justifyContent:'center',fontWeight:800,fontSize:11}}>{currentUser?.myNumber??currentUser?.id}</span>
                   <span style={{fontWeight:700,color:userStore.accent,fontSize:12}}>{currentUser?.name}</span>
                   {currentUser?.badge&&<BadgeIcon badge={currentUser.badge} size={18}/>}
+                  {canRestore(currentUser)&&(
                   <button onClick={()=>document.dispatchEvent(new CustomEvent('openStaffSettings'))} title="スタッフ管理"
                     style={{background:'none',border:'none',cursor:'pointer',color:'#6b7280',display:'flex',alignItems:'center',padding:'1px',borderRadius:3}}
                     onMouseEnter={e=>e.currentTarget.style.color='#c2410c'}
                     onMouseLeave={e=>e.currentTarget.style.color='#6b7280'}>
                     <Users size={14}/>
                   </button>
+                  )}
+                  {canRestore(currentUser)&&(
                   <button onClick={()=>setShowHoliday(true)} title="休業日設定"
                     style={{background:'none',border:'none',cursor:'pointer',color:'#6b7280',display:'flex',alignItems:'center',padding:'1px',borderRadius:3}}
                     onMouseEnter={e=>e.currentTarget.style.color='#c2410c'}
                     onMouseLeave={e=>e.currentTarget.style.color='#6b7280'}>
                     <Settings size={14}/>
                   </button>
-                  {(closedDays.length>0||closedDates.length>0)&&(
-                    <span style={{background:'#dc2626',color:'white',borderRadius:10,padding:'1px 5px',fontSize:10,fontWeight:700}}>{closedDays.length+closedDates.length}</span>
                   )}
+                  {/* 休業日の件数バッジは廃止（意味が伝わらないため・2026-09-11）。 */}
                   {/* データ復旧（バックアップから戻す）— 指定された4名のみ表示 */}
                   {canRestore(currentUser)&&(
                     <button onClick={()=>setShowRestore(true)} title="データ復旧（バックアップから戻す）"
@@ -9531,7 +10216,7 @@ function AppInner() {
                     </button>
                   )}
                   {/* 📋クリップボードコピーは廃止（戻せず一部データのみで紛らわしいため）。バックアップは自動保存＋🕒復旧に一本化。 */}
-                  <button onClick={()=>{releaseLock(curLockKey);setCurrentUserPersist(null);setCurLockKey(null);setModalOpen(false);}} title="ログアウト" style={{background:'none',border:'none',cursor:'pointer',color:'#6b7280',display:'flex',alignItems:'center'}}><LogOut size={14}/></button>
+                  <button onClick={()=>{releaseLock(curLockKey);setAuthAutoOff(true);setCurrentUserPersist(null);setCurLockKey(null);setModalOpen(false);}} title="ログアウト" style={{background:'none',border:'none',cursor:'pointer',color:'#6b7280',display:'flex',alignItems:'center'}}><LogOut size={14}/></button>
                 </div>
               </div>
             </div>
@@ -10705,6 +11390,7 @@ function AppInner() {
         onClose={()=>setShowStaffCal(false)}
         initMonth={curMonth}
         currentUser={currentUser}
+        adminMode={canRestore(currentUser)}
         dynStaffH={dynStaffH} dynStaffS={dynStaffS}
         dayOffDataH={dayOffDataH}   setDayOffDataH={setDayOffDataH}
         dayOffDataS={dayOffDataS}   setDayOffDataS={setDayOffDataS}
@@ -10848,7 +11534,7 @@ function App(){return <ErrorBoundary><GasDownBanner/><AppInner/></ErrorBoundary>
 
 // - スタイル定数 -
 const NAV_S    ={background:'#c2410c',color:'white',border:'none',borderRadius:7,padding:7,cursor:'pointer',display:'flex',alignItems:'center'};
-const BACK_S   ={display:'flex',alignItems:'center',gap:4,padding:'5px 11px',background:'#16a34a',border:'none',borderRadius:6,cursor:'pointer',fontWeight:700,fontSize:12,color:'white'};
+const BACK_S   ={display:'flex',alignItems:'center',gap:4,padding:'5px 11px',background:'#16a34a',border:'none',borderRadius:6,cursor:'pointer',fontWeight:700,fontSize:12,color:'white'}; // 代車管理の戻るボタン。DEVも本番と同じ緑（ユーザー指示・2026-09-12）
 const TBL      ={width:'100%',borderCollapse:'collapse',border:'1px solid #e5e7eb',borderRadius:8,overflow:'hidden',tableLayout:'auto'};
 const TD       ={padding:'7px 9px',borderBottom:'1px solid #f3f4f6',borderRight:'1px solid #f3f4f6'};
 const LBL      ={display:'block',fontSize:13,fontWeight:700,color:'#374151',marginBottom:5};
