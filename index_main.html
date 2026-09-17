@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- fixed-holiday-1778028748861 force-deploy-1789450224570 -->
+<!-- fixed-holiday-1778028748861 force-deploy-1789612195128 -->
 <html lang="ja">
 <head>
   <meta charset="UTF-8" />
@@ -17,7 +17,7 @@
     // 開きっぱなしのタブが旧コードのまま動き続けるのを防ぐ。画面復帰時と定期に自分自身を
     // no-store+クエリ付きで取得し、__APP_BUILD が変わっていれば「更新」バナーを表示する。
     // 本番デプロイ時は port_to_main.js が __APP_BUILD を自動更新する（手動更新不要）。
-    window.__APP_BUILD='build-1789450224570';
+    window.__APP_BUILD='build-1789612195128';
     (function(){
       var RUNNING=window.__APP_BUILD, shown=false, checking=false;
       function runningVer(){
@@ -116,7 +116,7 @@
 const { useState, useEffect, useLayoutEffect, useRef, useCallback, memo, useMemo } = React;
 
 // ★ バージョン管理：アップデートのたびにここだけ変更する
-const APP_VERSION = '2.32';
+const APP_VERSION = '2.43';
 // 本人認証を必須にするか。false の間は従来どおり名前を選ぶだけで入れる（移行期間）。
 //   false … 全員が今までどおり使える。端末の登録（＋スタッフを追加）は先にできる。
 //   true  … その端末で本人確認を済ませた人しかログイン画面に出ない。
@@ -2224,9 +2224,15 @@ const syncCustStatus=async(custId,newStatus,extraFields={},matchName,matchNo)=>{
 //     （＝「代車が消えたり現れたりする」の正体。2026-08-25にユーザーが報告）。
 //   ★id も savedAt も持たないレコードは判断材料が無いので従来どおり残す（custbk等の保護）。
 const SHARED_FRESH_MS = 180000; // 3分。GASへの書き込みは実測2〜4秒なので十分な猶予
+// ★id と savedAt の「大きい方」を時刻にする（Kyoshi承認のBLOCK-B変更・2026-09-16）。
+//   従来は id があれば savedAt を見なかった。id は作成時刻なので、既存の予約の名前や期間を
+//   変えても時刻が変わらず「サーバーの方が正」と判定され、GASの60秒キャッシュが返す古い値に
+//   数秒で上書きされていた（代車・レンタカーの利用者名を変えても元に戻る、と報告）。
+//   編集時に savedAt を打ち直せば、3分間はローカルの編集が古いキャッシュに負けない。
+//   サーバーにも同じ savedAt が入るので、キャッシュが切れた後は両方同じ値になる。
 function sharedRecTs(r){
   if(!r||typeof r!=='object')return 0;
-  return Number(r.id)||Number(r.savedAt)||0;
+  return Math.max(Number(r.id)||0, Number(r.savedAt)||0);
 }
 function sharedRecFresh(r,nowTs){
   const t=sharedRecTs(r);
@@ -2283,14 +2289,125 @@ function mergeSharedObjects(local, server, nowTs){
   return mg;
 }
 
+// ── まとめ読みポーラー（Kyoshi承認のBLOCK-B変更・2026-09-17）────────────────────────
+//   従来は useShared ごとに setInterval で sGet(key) を投げていた＝画面1つで約20本/分。
+//   人数分が重なると、GASが遅い朝（2026-09-17 は読みに30〜90秒・Googleの404ページ）に
+//   リクエストが積み上がって同時実行数を食いつぶし、さらに遅くなる悪循環になっていた。
+//   全 useShared を1つの台帳に登録し、5秒ごとに「期限が来たキー」だけを ?keys= で1回にまとめて読む
+//   （GAS側は v11 から対応済み。スマホ版と同じ方式）。
+//   受け取り側の規則（形チェック・マージ・書き込み中は上書きしない・非表示タブは止める）は従来どおり。
+//   まとめ読みが2回続けて失敗したら markGasDown（赤い帯）。個別 sGet へは戻さない（本数を増やさないため）。
+const __hubPoll = { subs:new Map(), seq:0, timer:null, inFlight:false, kick:null };
+const POLL_TICK_MS = 5000;
+// ★操作のない画面は間引く：最後の操作から5分たったら、どのキーも3分に1回しか読まない
+//   （開きっぱなしのPCが人数分ぶら下がっているのが、同時実行数を食う一番の原因）。
+//   触った瞬間に通常の周期へ戻り、直近の変更はその次の読みで追いつく。
+const POLL_IDLE_AFTER_MS = 5 * 60 * 1000, POLL_IDLE_EVERY_MS = 3 * 60 * 1000;
+try { window.__hubLastActivity = Date.now(); } catch (e) {}
+const __hubTouch = () => { try { window.__hubLastActivity = Date.now(); } catch (e) {} };
+try {
+  ['pointerdown', 'keydown', 'wheel', 'touchstart'].forEach(ev => window.addEventListener(ev, __hubTouch, { passive:true }));
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') __hubTouch(); });
+} catch (e) {}
+const __hubIdle = () => (Date.now() - (window.__hubLastActivity || 0)) > POLL_IDLE_AFTER_MS;
+// ?keys= でまとめて読む。{キー: 値(JSON解析済み) | null} を返す。全体が失敗したら null。
+const sGetManyMap = async ks => {
+  if (!GAS_READY || !ks.length) return null;
+  const ctl = (typeof AbortController === 'function') ? new AbortController() : null;
+  // ★1本が詰まっても150秒で諦める。45秒にしていたら、GASが60〜120秒かかる日（2026-09-17）に
+  //   毎回諦めて「接続済みなのに予定が出ない」になった。従来のキーごと読みは無制限に待っていた。
+  const killer = ctl ? setTimeout(() => { try { ctl.abort(); } catch (e) {} }, 150000) : null;
+  try {
+    const r = await fetch(GAS_URL + '?keys=' + encodeURIComponent(ks.join(',')) + '&apiKey=' + encodeURIComponent(GAS_API_KEY),
+      Object.assign({ cache:'no-store' }, ctl ? { signal: ctl.signal } : {}));
+    if (r.status === 503) return null;
+    const t = await r.text();
+    // 'null' は「まとめ読みに対応していないGAS」の合図（対応版は必ずJSONの辞書を返す）。失敗とは区別して個別読みに戻す
+    if (t === 'null') return 'unsupported';
+    if (!t || t.startsWith('error') || t === 'unauthorized') return null;
+    let map; try { map = JSON.parse(t); } catch (e) { return null; }      // GoogleのHTMLエラーページ等
+    if (map === null || typeof map !== 'object' || Array.isArray(map)) return null;
+    const out = {};
+    ks.forEach(k => {
+      const s = map[k];
+      if (!s || s === 'null' || typeof s !== 'string' || s.startsWith('error:')) { out[k] = null; return; }
+      try {
+        const parsed = JSON.parse(s);
+        out[k] = (parsed && typeof parsed === 'object' && parsed.error) ? null : parsed;   // sGet と同じ扱い
+      } catch (e) { out[k] = null; }
+    });
+    return out;
+  } catch (e) { return null; }
+  finally { if (killer) clearTimeout(killer); }
+};
+async function __hubPollTick() {
+  if (!GAS_READY || __hubPoll.inFlight) return;   // 前回が終わるまで次を撃たない（積み上がり防止）
+  const now = Date.now();
+  const due = [];
+  __hubPoll.subs.forEach(s => {
+    if (!s.isActive()) return;
+    if (!s.loaded) { due.push(s); return; }                          // 初回読み込みは非表示でも行う
+    if (document.visibilityState === 'hidden') return;               // 非表示タブはポーリング停止（従来どおり）
+    // 操作の無い画面は3分に1回に間引く（next は「前回読んだ時刻＋周期」なので、周期を3分に引き延ばす）
+    const dueAt = __hubIdle() ? Math.max(s.next, (s.next - s.pollMs) + POLL_IDLE_EVERY_MS) : s.next;
+    if (now >= dueAt) due.push(s);
+  });
+  if (!due.length) return;
+  __hubPoll.inFlight = true;
+  try {
+    const keys = [...new Set(due.map(s => s.key))];
+    let map = null;
+    for (let attempt = 0; attempt < 2 && !map; attempt++) {
+      map = await sGetManyMap(keys);
+      if (map === 'unsupported') {
+        // まとめ読み非対応（旧GAS・テストの模擬）→ 従来どおりキーごとに読む
+        const vals = await Promise.all(keys.map(k => sGet(k).catch(() => null)));
+        map = {}; keys.forEach((k, i) => { map[k] = vals[i]; });
+        break;
+      }
+      if (!map && due.some(s => !s.loaded)) break;                  // 初回読み込みが混じっていれば、待たずに下のキーごと読みへ
+      if (!map && attempt === 0) await new Promise(r => setTimeout(r, 2500));
+    }
+    if (!map) {
+      markGasDown();
+      // ★初回読み込みがまだのキーは、従来どおりキーごとに読む（待ち時間は無制限）。
+      //   まとめ読みが不調でも「開いたのに予定が何も出ない」を避ける。ポーリング分は10秒後にまた試す。
+      const firsts = due.filter(s => !s.loaded);
+      if (firsts.length) {
+        const fk = [...new Set(firsts.map(s => s.key))];
+        const vals = await Promise.all(fk.map(k => sGet(k).catch(() => null)));
+        const fm = {}; fk.forEach((k, i) => { fm[k] = vals[i]; });
+        if (vals.some(v => v !== null)) markGasUp();
+        firsts.forEach(s => { s.loaded = true; try { s.onInitial((s.key in fm) ? fm[s.key] : null); } catch (e) {} s.next = Date.now() + s.pollMs; });
+      }
+      due.forEach(s => { if (s.loaded && !firsts.includes(s)) s.next = Date.now() + 10000; });
+      return;
+    }
+    markGasUp();
+    due.forEach(s => {
+      const v = (s.key in map) ? map[s.key] : null;
+      if (!s.loaded) { s.loaded = true; try { s.onInitial(v); } catch (e) {} }
+      else { try { s.onPoll(v); } catch (e) {} }
+      s.next = Date.now() + s.pollMs;
+    });
+  } finally { __hubPoll.inFlight = false; }
+}
+const __hubPollRegister = s => {
+  const id = ++__hubPoll.seq;
+  __hubPoll.subs.set(id, Object.assign({ next:0, loaded:false }, s));
+  if (!__hubPoll.timer && GAS_READY) __hubPoll.timer = setInterval(__hubPollTick, POLL_TICK_MS);
+  // 起動直後は多くのキーが一斉に登録される。少し待ってから1回でまとめて読む
+  if (!__hubPoll.kick) __hubPoll.kick = setTimeout(() => { __hubPoll.kick = null; __hubPollTick(); }, 300);
+  return id;
+};
+const __hubPollUnregister = id => { __hubPoll.subs.delete(id); };
+
 function useShared(key, def, pollMs=60000) {
   const [val, setVal] = useState(def);
   const mounted      = useRef(true);
   const localRef     = useRef(def);
   const initialized  = useRef(false);
   const writeCount   = useRef(0);
-  const pollTimer    = useRef(null);
-  const inFlight     = useRef(false); // ポーリングの多重発射防止
 
   // ★形チェック: defと同種（配列/オブジェクト）でない応答は反映せず記録して無視する。
   //   GASの同時アクセス混線で異形のJSONが返るとタイムスケジュール等の表示が丸ごと消えるため
@@ -2307,38 +2424,28 @@ function useShared(key, def, pollMs=60000) {
     console.warn('[useShared] 期待と異なる形の応答を無視しました:',key,v);
   };
 
+  // ★初回読み込みとポーリングは、まとめ読みポーラー（上）に登録して行う（Kyoshi承認のBLOCK-B変更・2026-09-17）。
+  //   受け取った値の扱いは従来のまま：初回は形が正しければ反映、ポーリングは
+  //   「書き込み中は上書きしない／異形は無視／オブジェクトはマージ」。
   useEffect(() => {
     mounted.current = true;
-    sGet(key).then(v => {
-      if (!mounted.current) return;
-      if (v !== null) {
-        if (shapeOk(v)) { localRef.current = v; setVal(v); } // 初期ロードは形が正しければ反映
-        else logShapeAnomaly(v); // 異形はdefのまま起動し次のポーリングで追いつく
-      }
-      initialized.current = true;
-    }).catch(() => { initialized.current = true; });
-    return () => {
-      mounted.current = false;
-      if (pollTimer.current)  clearInterval(pollTimer.current);
-    };
-  }, [key]);
-
-  useEffect(() => {
-    if (!GAS_READY) return;
-    pollTimer.current = setInterval(() => {
-      if (!mounted.current || !initialized.current) return; // writeCountチェック削除済み
-      // ★非表示タブはポーリング停止（GAS同時実行数の負荷軽減。2026-06-13 Kyoshi承認のBLOCK-B変更）
-      //   画面復帰時はvisibilitychangeハンドラがinspを即時再取得し、他キーも次のポーリングで追いつく
-      if (document.visibilityState === 'hidden') return;
-      // ★前回の取得が未完了なら今回はスキップ。GASが遅い時にリクエストが積み上がって
-      //   同時実行数が雪だるま式に膨らむのを防ぐ（2026-07-03 Kyoshi承認のBLOCK-B変更）
-      if (inFlight.current) return;
-      inFlight.current = true;
-      sGet(key).then(v => {
+    initialized.current = false;
+    const id = __hubPollRegister({
+      key, pollMs,
+      isActive: () => mounted.current,
+      onInitial: v => {
+        if (!mounted.current) return;
+        if (v !== null) {
+          if (shapeOk(v)) { localRef.current = v; setVal(v); } // 初期ロードは形が正しければ反映
+          else logShapeAnomaly(v); // 異形はdefのまま起動し次のポーリングで追いつく
+        }
+        initialized.current = true;
+      },
+      onPoll: v => {
         // ★書き込みがまだGASに届ききっていない間はサーバー値で上書きしない。
         //   GASの書き込みは1本10〜27秒かかり順番待ちもあるため、writeCountの70秒解除だけでは
         //   足りずに「保存したのに画面から消える」が起きる（2026-08-24）。
-        if (!mounted.current || v === null || writeCount.current > 0) return;
+        if (!mounted.current || !initialized.current || v === null || writeCount.current > 0) return;
         if ((window.__hubWriteBusy||0) > 0) return;
         if (!shapeOk(v)) { logShapeAnomaly(v); return; } // 異形の応答は表示に反映しない
         const cur  = JSON.stringify(localRef.current);
@@ -2356,9 +2463,9 @@ function useShared(key, def, pollMs=60000) {
             localRef.current = v; setVal(v);
           }
         }
-      }).catch(() => {}).finally(() => { inFlight.current = false; });
-    }, pollMs);
-    return () => { if (pollTimer.current) clearInterval(pollTimer.current); };
+      },
+    });
+    return () => { mounted.current = false; __hubPollUnregister(id); };
   }, [key, pollMs]);
 
   const update = useCallback((fn) => {
@@ -2455,14 +2562,13 @@ const staffregLockClear = (user) => { if(_staffregLockHolder===user) _staffregLo
 const StaffRegisterModal=memo(({isOpen,onClose,staffListH,staffListS,onSave})=>{
   const [name,setName]=useState('');
   const [badge,setBadge]=useState('mechanic');
-  const [myNumber,setMyNumber]=useState(null);
   const [store,setStore]=useState('honten');
   const [lockedBy,setLockedBy]=useState(null);
   const lockPollRef=useRef(null);
 
   useEffect(()=>{
     if(!isOpen)return;
-    setName('');setBadge('mechanic');setMyNumber(null);setStore('honten');
+    setName('');setBadge('mechanic');setStore('honten');
     const holder = staffregLockGet();
     if(holder && holder!=='新規登録'){
       setLockedBy(holder);
@@ -2479,16 +2585,15 @@ const StaffRegisterModal=memo(({isOpen,onClose,staffListH,staffListS,onSave})=>{
 
   const allStaff=[...(staffListH||[]),...(staffListS||[])];
   const currentList=store==='honten'?staffListH:staffListS;
-  const usedNumbers=allStaff.map(s=>s.myNumber);
-  const isNumUsed=n=>usedNumbers.includes(n);
   const storeObj=STORES.find(s=>s.id===store);
 
+  // 番号（myNumber）は画面に出さない。本人確認はメール＋利用証で行うので、番号は
+  // 並び順や社長判定に使う裏方の値になった（2026-09-15）。空いている最小の番号を自動で振る。
+  const nextNumber=()=>{const used=new Set(allStaff.map(s=>Number(s.myNumber)));let i=1;while(used.has(i))i++;return i;};
   const handleSave=()=>{
     if(!name.trim()){alert('名前を入力してください');return;}
-    if(myNumber===null){alert('マイナンバーを選択してください');return;}
-    if(isNumUsed(myNumber)){alert('そのマイナンバーはすでに使用されています');return;}
     const uid=`${store[0]}${Date.now()}`;
-    onSave({uid,name:name.trim(),badge,myNumber,store});
+    onSave({uid,name:name.trim(),badge,myNumber:nextNumber(),store});
     // onClose は親(handleRegisterStaff)側で制御するため呼ばない
   };
 
@@ -2556,33 +2661,11 @@ const StaffRegisterModal=memo(({isOpen,onClose,staffListH,staffListS,onSave})=>{
               </div>
             </div>
 
-            {/* マイナンバー選択 */}
-            <div>
-              <div style={{fontWeight:700,fontSize:13,color:'#374151',marginBottom:4}}>🔢 マイナンバー（0〜99）</div>
-              <div style={{fontSize:11,color:'#9ca3af',marginBottom:8}}>担当者入力時に使う個人識別番号。スポーツのゼッケンのようなもの。</div>
-              <div style={{display:'grid',gridTemplateColumns:'repeat(10,1fr)',gap:4,maxHeight:160,overflowY:'auto',padding:2}}>
-                {Array.from({length:100},(_,i)=>{
-                  const used=isNumUsed(i);
-                  const sel=myNumber===i;
-                  return(
-                    <button key={i} onClick={()=>!used&&setMyNumber(i)}
-                      disabled={used}
-                      style={{padding:'5px 0',borderRadius:6,border:`2px solid ${sel?storeObj.color:used?'#f3f4f6':'#e5e7eb'}`,background:sel?storeObj.color:used?'#f9fafb':'white',color:sel?'white':used?'#d1d5db':'#374151',fontWeight:sel?800:500,fontSize:12,cursor:used?'not-allowed':'pointer',opacity:used?0.5:1,transition:'all 0.08s'}}>
-                      {i}
-                    </button>
-                  );
-                })}
-              </div>
-              {myNumber!==null&&<div style={{marginTop:6,padding:'5px 10px',background:storeObj.bg,border:`1px solid ${storeObj.color}44`,borderRadius:6,fontSize:12,color:storeObj.color,fontWeight:700,display:'inline-flex',alignItems:'center',gap:5}}>
-                選択中：<span style={{fontSize:16,fontWeight:900}}>#{myNumber}</span>
-              </div>}
-            </div>
-
             {/* 保存ボタン */}
             <div style={{display:'flex',gap:8,paddingBottom:8}}>
               <button onClick={handleSave}
-                disabled={!name.trim()||myNumber===null}
-                style={{flex:1,padding:'13px 0',background:name.trim()&&myNumber!==null?`linear-gradient(135deg,${storeObj.color},${storeObj.accent})`:'#e5e7eb',color:name.trim()&&myNumber!==null?'white':'#9ca3af',border:'none',borderRadius:10,fontWeight:800,fontSize:15,cursor:name.trim()&&myNumber!==null?'pointer':'default',transition:'all 0.15s'}}>
+                disabled={!name.trim()}
+                style={{flex:1,padding:'13px 0',background:name.trim()?`linear-gradient(135deg,${storeObj.color},${storeObj.accent})`:'#e5e7eb',color:name.trim()?'white':'#9ca3af',border:'none',borderRadius:10,fontWeight:800,fontSize:15,cursor:name.trim()?'pointer':'default',transition:'all 0.15s'}}>
                 ✓ 登録する
               </button>
               <button onClick={onClose} style={{padding:'13px 18px',background:'#f3f4f6',border:'none',borderRadius:10,fontWeight:600,cursor:'pointer',color:'#374151'}}>キャンセル</button>
@@ -2601,7 +2684,6 @@ const StaffSettingsModal=memo(({isOpen,onClose,staffListH,staffListS,onUpdate,on
   const [selUid,setSelUid]=useState(null);
   const [editName,setEditName]=useState('');
   const [editBadge,setEditBadge]=useState('mechanic');
-  const [editNumber,setEditNumber]=useState(null);
   const [editCaps,setEditCaps]=useState({}); // capabilities
   const [editStore,setEditStore]=useState('honten');
   const [confirmDel,setConfirmDel]=useState(false);
@@ -2646,7 +2728,7 @@ const StaffSettingsModal=memo(({isOpen,onClose,staffListH,staffListS,onUpdate,on
   const storeObj=STORES.find(s=>s.id===tab);
 
   const selectStaff=(s)=>{
-    setSelUid(s.uid);setEditName(s.name);setEditBadge(s.badge||'mechanic');setEditNumber(s.myNumber);setConfirmDel(false);
+    setSelUid(s.uid);setEditName(s.name);setEditBadge(s.badge||'mechanic');setConfirmDel(false);
     setEditEmail(s.loginEmail||'');setInviteMsg('');
     setEditCaps(s.capabilities||getDefaultCapabilities(s.badge||'mechanic'));
     setEditStore(s.store||'honten');
@@ -2656,9 +2738,8 @@ const StaffSettingsModal=memo(({isOpen,onClose,staffListH,staffListS,onUpdate,on
     if(!editName.trim())return;
     const target=allStaff.find(s=>s.uid===selUid);
     if(!target)return;
-    // 番号重複チェック（自分以外）
-    if(allStaff.some(s=>s.uid!==selUid&&s.myNumber===editNumber)){alert('そのマイナンバーはすでに使用されています');return;}
-    onUpdate({...target,name:editName.trim(),badge:editBadge,myNumber:editNumber,capabilities:editCaps,store:editStore,
+    // 番号（myNumber）は画面から外した。既存の値をそのまま引き継ぐ（並び順・社長判定の裏方の値）
+    onUpdate({...target,name:editName.trim(),badge:editBadge,capabilities:editCaps,store:editStore,
       loginEmail:editEmail.trim().toLowerCase()||undefined});
     setSelUid(null);
   };
@@ -2670,7 +2751,6 @@ const StaffSettingsModal=memo(({isOpen,onClose,staffListH,staffListS,onUpdate,on
     setSelUid(null);setConfirmDel(false);
   };
 
-  const usedNumbers=allStaff.filter(s=>s.uid!==selUid).map(s=>s.myNumber);
   const selectedStaff=allStaff.find(s=>s.uid===selUid);
 
   return(
@@ -2769,7 +2849,7 @@ const StaffSettingsModal=memo(({isOpen,onClose,staffListH,staffListS,onUpdate,on
                     <button key={s.uid} onClick={()=>selectStaff(s)}
                       style={{width:'100%',display:'flex',alignItems:'center',gap:8,padding:'9px 12px',border:'none',borderBottom:'1px solid #f3f4f6',background:selUid===s.uid?storeObj.bg:'white',cursor:'pointer',textAlign:'left',transition:'background 0.1s'}}>
                       <span style={{width:24,height:24,borderRadius:'50%',background:selUid===s.uid?storeObj.color:'#e5e7eb',color:selUid===s.uid?'white':'#6b7280',display:'flex',alignItems:'center',justifyContent:'center',fontWeight:800,fontSize:11,flexShrink:0}}>
-                        {s.myNumber}
+                        {String(s.name||'').charAt(0)}
                       </span>
                       <div style={{flex:1,minWidth:0}}>
                         <div style={{fontWeight:selUid===s.uid?800:600,fontSize:12,color:selUid===s.uid?storeObj.color:'#374151',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{s.name}</div>
@@ -3009,24 +3089,6 @@ const StaffSettingsModal=memo(({isOpen,onClose,staffListH,staffListS,onUpdate,on
                     </div>
                   </div>
 
-                  {/* マイナンバー */}
-                  <div>
-                    <div style={{fontWeight:700,fontSize:12,color:'#374151',marginBottom:4}}>🔢 マイナンバー（0〜99）</div>
-                    <div style={{display:'grid',gridTemplateColumns:'repeat(10,1fr)',gap:3,padding:2}}>
-                      {Array.from({length:100},(_,i)=>{
-                        const used=usedNumbers.includes(i);
-                        const sel=editNumber===i;
-                        return(
-                          <button key={i} onClick={()=>!used&&setEditNumber(i)}
-                            disabled={used}
-                            style={{padding:'4px 0',borderRadius:5,border:`2px solid ${sel?storeObj.color:used?'#f3f4f6':'#e5e7eb'}`,background:sel?storeObj.color:used?'#f9fafb':'white',color:sel?'white':used?'#d1d5db':'#374151',fontWeight:sel?800:500,fontSize:11,cursor:used?'not-allowed':'pointer',opacity:used?0.4:1}}>
-                            {i}
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </div>
-
                   {/* 対応可能業務 */}
                   <div>
                     <div style={{fontWeight:700,fontSize:12,color:'#374151',marginBottom:6}}>⚙️ 対応可能業務</div>
@@ -3093,13 +3155,41 @@ const StaffSettingsModal=memo(({isOpen,onClose,staffListH,staffListS,onUpdate,on
 // 登録が済んだら（やめた時も）URLから印を外す。残すと開き直すたびに登録画面が出る。
 const HUB_INVITE_ID=(()=>{try{return new URLSearchParams(location.search).get('inv')||'';}catch(e){return '';}})();
 const hubDropInvite=()=>{ if(!HUB_INVITE_ID)return; try{history.replaceState(null,'',location.pathname+location.hash);}catch(e){} };
-const AuthAddScreen=({onDone,onCancel})=>{
+// ── 登録の引き継ぎ（?hand=…）──────────────────────────────────────
+//   iPhoneでは Safari／LINEやメールの中のブラウザ／ホーム画面に追加したアイコン が、それぞれ別の保管場所を持つ。
+//   Safariで登録してもアイコンから開くと未登録になり、もう一度メール→6桁をやらされていた（2026-09-16 竹林）。
+//   登録が済んだブラウザが「引き継ぎの印」を作ってURLに付け（?hand=…）、その印つきURLから開いた側は
+//   印を出して同じ利用証を受け取る。台帳に行は増えない（同じ端末の行を共有する）。印は30分で消える。
+const HUB_HANDOFF_ID=(()=>{try{return new URLSearchParams(location.search).get('hand')||'';}catch(e){return '';}})();
+const hubIsPhone=()=>/iPhone|iPad|iPod|Android/i.test(navigator.userAgent||'');
+// 印を作る（この端末の利用証が要る。finish の直後に呼ぶ）
+const hubMakeHandoff=async()=>{ try{ const r=await hubAuthCall('authHandoff'); return (r&&r.ok&&r.hand)?String(r.hand):''; }catch(e){ return ''; } };
+// 印を出して利用証を受け取る。成功したら true。URLの印は結果にかかわらず外す
+const hubTakeHandoff=async()=>{
+  if(!HUB_HANDOFF_ID) return false;
+  let r=null;
+  try{ r=await hubAuthCall('authHandoffTake',{hand:HUB_HANDOFF_ID}); }catch(e){}
+  try{history.replaceState(null,'',location.pathname+location.hash);}catch(e){}   // 使った印はURLから外す
+  if(!r||!r.ok||!r.token) return false;
+  const list=hubLoadMine().filter(x=>x&&x.name!==r.name);
+  list.push({uid:r.uid||'',name:r.name,myNumber:r.myNumber,store:r.store||'honten',
+             token:r.token,exp:r.exp,isDevice:!!r.device,isAdmin:!!r.admin});
+  hubSaveMine(list);
+  if(r.kind&&!hubKind()) hubSetKind(r.kind);
+  if(r.label&&!hubLabel()) hubSetLabel(r.label);
+  hubApplyToken(r.token);
+  return true;
+};
+
+const AuthAddScreen=({onDone,onCancel,staffH,staffS})=>{
   const [inv,setInv]=useState(HUB_INVITE_ID);   // 招待リンクの印。これがあればアドレスは要らない
   const [step,setStep]=useState(HUB_INVITE_ID?'code':'email');   // email → code → kind → done（招待リンクからは code から）
   const [email,setEmail]=useState('');
   const [code,setCode]=useState('');
   const [kind,setKind]=useState(hubKind());
   const [busy,setBusy]=useState(false);
+  const [sending,setSending]=useState(false);   // 裏でサーバーにアドレスを確認中
+  const [hand,setHand]=useState('');            // 登録直後に作る引き継ぎの印（スマホ）
   const [err,setErr]=useState('');
   const [who,setWho]=useState(null);
   const [pend,setPend]=useState(null);
@@ -3117,13 +3207,17 @@ const AuthAddScreen=({onDone,onCancel})=>{
     setErr('');setBusy(true);
     // 印があってアドレスが無ければ、印で送る（サーバーが印からアドレスを引く）
     const who=(!target&&inv)?{inv}:{email:target};
+    // ★サーバーの返事を待たずに6桁の画面へ進む。招待メールに6桁が書いてあるのが普通なので、
+    //   返事（3〜30秒）を待っている間に打ってもらえる。登録されていないアドレスなら戻して知らせる。
+    if(!resend){ setStep('code'); setFromInvite(true); }
+    setSending(true);
     const r=await hubAuthCall('authRequest',Object.assign(who,resend?{resend:'1'}:{}));
-    setBusy(false);
+    setBusy(false); setSending(false);
     // すでに招待メールに6桁が書いてある場合は、送り直さずそれを使ってもらう
     if(r&&r.ok) setFromInvite(!!r.existing);
     if(r&&r.err==='bad_invite'){ useEmailInstead('この招待リンクは期限切れです。メールアドレスを入れて、新しいコードを受け取ってください。'); return; }
     if(!r||!r.ok){
-      setStep('email');
+      setStep('email'); setFromInvite(false); setCode('');   // 先に進めていた6桁の画面から戻す
       setErr(r&&r.err==='not_registered'
         ? 'このアドレスは登録されていません。管理者にご確認ください。'
         : r&&r.err==='too_many' ? '送信が続いています。しばらく待ってからお試しください。'
@@ -3159,11 +3253,20 @@ const AuthAddScreen=({onDone,onCancel})=>{
   const planOf=async r=>{
     try{
       const store=(r&&r.store)==='sanda'?'sanda':'honten';
-      const list=await sGet(STOR+store+'-staff-v2');
+      // サーバーの最新は5秒だけ待つ（混み合うと30秒以上かかり、6桁のあとにまた待たされていた）。
+      // 間に合わなければ、画面がすでに持っているスタッフ表で決める。それも無ければ本人に選んでもらう。
+      const have=store==='sanda'?staffS:staffH;
+      const fresh=await Promise.race([sGet(STOR+store+'-staff-v2'),new Promise(res=>setTimeout(()=>res(null),5000))]);
+      const list=(Array.isArray(fresh)&&fresh.length)?fresh:((Array.isArray(have)&&have.length)?have:[]);
       const me=(Array.isArray(list)?list:[]).find(x=>x&&((r.uid&&x.uid===r.uid)||x.name===r.name));
       return (me&&Array.isArray(me.devPlan))?me.devPlan.filter(Boolean):[];
     }catch(e){ return []; }
   };
+  // 登録が済んだら、スマホでは引き継ぎの印を作っておく（スマホ版へ移る／ホーム画面に追加する時に使う）
+  useEffect(()=>{
+    if(step!=='done'||!hubIsPhone()||hand)return;
+    (async()=>{ const h=await hubMakeHandoff(); if(h) setHand(h); })();
+  },[step]);
   // 管理者が決めた端末名を読む（無くても止まらない。その場で入力できる）
   useEffect(()=>{
     if(step!=='label'||devNames!==null)return;
@@ -3224,7 +3327,9 @@ const AuthAddScreen=({onDone,onCancel})=>{
     color:on?'white':'#9ca3af',border:'none',borderRadius:11,fontWeight:800,fontSize:15,cursor:on?'pointer':'default',marginTop:14});
   const SUB={width:'100%',padding:'10px 0',background:'#f8fafc',border:'2px solid #cbd5e1',borderRadius:9,
     fontWeight:700,fontSize:13,color:'#475569',cursor:'pointer',marginTop:9};
-  const ERR=err?<div style={{color:'#dc2626',fontWeight:700,fontSize:12.5,marginTop:8}}>{err}</div>:null;
+  const ERR=err?<div style={{color:'#dc2626',fontWeight:700,fontSize:12.5,marginTop:8}}>{err}</div>
+    :busy&&step==='code'?<div style={{color:'#6b7280',fontSize:12,marginTop:8}}>確認しています。混み合っていると20〜30秒かかることがあります…</div>
+    :sending?<div style={{color:'#9ca3af',fontSize:11.5,marginTop:8}}>（アドレスをサーバーに確認中。そのまま6桁を入れて進めます）</div>:null;
   const CARD={width:'100%',textAlign:'left',padding:'13px 15px',borderRadius:10,border:'2px solid #cbd5e1',background:'white',cursor:'pointer'};
 
   return(
@@ -3373,7 +3478,19 @@ const AuthAddScreen=({onDone,onCancel})=>{
               次からは、この端末を開くだけで使えます。<br/>
               使っているうちは登録が切れることはありません。
             </div>
-            <button style={BTN(true)} onClick={()=>onDone&&onDone(who)}>はじめる →</button>
+            {hubIsPhone()&&(
+              <div style={{marginTop:12,padding:'12px 13px',background:'#eef2ff',border:'2px solid #c7d2fe',borderRadius:10}}>
+                <div style={{fontWeight:800,fontSize:13.5,color:'#3730a3'}}>📱 スマホの方はスマホ版へ</div>
+                <div style={{fontSize:12,color:'#4338ca',lineHeight:1.7,marginTop:4}}>
+                  この登録をそのまま引き継ぎます。スマホ版の画面で「ホーム画面に追加」もできます。
+                </div>
+                <button style={{...BTN(!!hand),marginTop:10}} disabled={!hand}
+                  onClick={()=>{ location.href='mobile.html?hand='+encodeURIComponent(hand); }}>
+                  {hand?'スマホ版を開く →':'準備しています…'}
+                </button>
+              </div>
+            )}
+            <button style={hubIsPhone()?SUB:BTN(true)} onClick={()=>onDone&&onDone(who)}>{hubIsPhone()?'このままPC版を使う':'はじめる →'}</button>
           </div>
         )}
       </div>
@@ -3406,9 +3523,6 @@ const LoginScreen=({onLogin,staffListH,staffListS,onRegister,onSettings,desktopL
             return(
               <button key={s.uid} onClick={()=>setSel({staff:s,store})}
                 style={{padding:'8px 12px',borderRadius:9,border:`2px solid ${isS?store.color:'#e5e7eb'}`,background:isS?store.color:'white',color:isS?'white':'#374151',fontWeight:isS?800:500,fontSize:13,cursor:'pointer',display:'flex',alignItems:'center',gap:8,textAlign:'left',transition:'all 0.12s'}}>
-                <span style={{width:26,height:26,borderRadius:'50%',background:isS?'rgba(255,255,255,0.25)':store.bg,color:isS?'white':store.color,display:'flex',alignItems:'center',justifyContent:'center',fontWeight:800,fontSize:11,flexShrink:0,border:`2px solid ${isS?'rgba(255,255,255,0.4)':store.color+'44'}`}}>
-                  {s.myNumber}
-                </span>
                 <span style={{flex:1}}>{s.name}</span>
                 <BadgeIcon badge={s.badge} size={18}/>
               </button>
@@ -3428,7 +3542,7 @@ const LoginScreen=({onLogin,staffListH,staffListS,onRegister,onSettings,desktopL
         <div style={{background:'white',borderRadius:20,padding:'28px 32px',maxWidth:480,width:'100%',boxShadow:'0 30px 80px rgba(0,0,0,0.4)'}}>
           <div style={{textAlign:'center',marginBottom:20}}>
             <div style={{fontSize:36,marginBottom:4}}>🖥️</div>
-            <div style={{fontWeight:800,fontSize:16,color:'white'}}>{deskSel.name}</div>
+            <div style={{fontWeight:800,fontSize:16,color:'#111827'}}>{deskSel.name}</div>
             <div style={{fontSize:12,color:'#6b7280',marginTop:2}}>操作するスタッフを選んでください</div>
           </div>
           <div style={{textAlign:'center',marginBottom:14}}>
@@ -3440,9 +3554,6 @@ const LoginScreen=({onLogin,staffListH,staffListS,onRegister,onSettings,desktopL
               return(
                 <button key={s.uid} onClick={()=>setSel({staff:s,store})}
                   style={{padding:'10px 14px',borderRadius:10,border:`2px solid ${isS?store.color:'#e5e7eb'}`,background:isS?store.color:'white',color:isS?'white':'#374151',fontWeight:isS?800:500,fontSize:14,cursor:'pointer',display:'flex',alignItems:'center',gap:10,transition:'all 0.12s'}}>
-                  <span style={{width:28,height:28,borderRadius:'50%',background:isS?'rgba(255,255,255,0.25)':store.bg,color:isS?'white':store.color,display:'flex',alignItems:'center',justifyContent:'center',fontWeight:800,fontSize:12,flexShrink:0,border:`2px solid ${isS?'rgba(255,255,255,0.4)':store.color+'44'}`}}>
-                    {s.myNumber}
-                  </span>
                   <span style={{flex:1}}>{s.name}</span>
                   <BadgeIcon badge={s.badge} size={18}/>
                 </button>
@@ -3511,9 +3622,6 @@ const LoginScreen=({onLogin,staffListH,staffListS,onRegister,onSettings,desktopL
               </div>
               <button onClick={()=>setSel({staff:president,store:presStore})}
                 style={{width:'100%',padding:'8px 12px',borderRadius:9,border:`2px solid ${isS?presStore.color:'#e5e7eb'}`,background:isS?presStore.color:'white',color:isS?'white':'#374151',fontWeight:isS?800:500,fontSize:13,cursor:'pointer',display:'flex',alignItems:'center',gap:8,textAlign:'left',transition:'all 0.12s'}}>
-                <span style={{width:26,height:26,borderRadius:'50%',background:isS?'rgba(255,255,255,0.25)':presStore.bg,color:isS?'white':presStore.color,display:'flex',alignItems:'center',justifyContent:'center',fontWeight:800,fontSize:11,flexShrink:0,border:`2px solid ${isS?'rgba(255,255,255,0.4)':presStore.color+'44'}`}}>
-                  {president.myNumber}
-                </span>
                 <span style={{flex:1}}>{president.name}</span>
                 <BadgeIcon badge={president.badge} size={18}/>
               </button>
@@ -5835,7 +5943,7 @@ const TireEditModal=memo(({isOpen,onClose,allCarsH,allCarsS,rentalCars,tireData,
                 return(
                   <div key={car.id} style={{display:'flex',alignItems:'center',gap:8,padding:'8px 10px',marginBottom:5,background:'#f8fafc',borderRadius:8,border:'1px solid #e5e7eb'}}>
                     <div style={{flex:1,minWidth:0}}>
-                      <div style={{fontWeight:700,fontSize:13,color:'white'}}>{car.name}</div>
+                      <div style={{fontWeight:700,fontSize:13,color:'#111827'}}>{car.name}</div>
                       <div style={{fontSize:10,color:'#9ca3af'}}>{car.num||'—'}</div>
                     </div>
                     <div style={{display:'flex',gap:5,flexShrink:0}}>
@@ -6386,6 +6494,22 @@ const LoanerSettingsModal = memo(({isOpen, onClose, listH, listS, onSaveH, onSav
     setItems(p => p.map((c,idx)=>idx===i?{...c,name:editName.trim(),num:editNum.trim()}:c));
     setEditIdx(null);
   };
+  // ★入力途中の変更を一覧に反映して返す。「✓」を押さずに「保存」を押しても変更が効くように
+  //   （✓を押し忘れて保存すると元の名前のまま、という報告 2026-09-16）。
+  //   ・編集中の行 … 入力中の車両名・ナンバー（車両名が空なら元のまま）
+  //   ・追加フォーム … 車両名が入っていれば「追加」を押していなくても足す
+  const withPending = list => {
+    let out = list;
+    if (editIdx !== null && editName.trim() && out[editIdx]) {
+      out = out.map((c,idx)=>idx===editIdx?{...c,name:editName.trim(),num:editNum.trim()}:c);
+    }
+    if (addName.trim() && out.length < 20) {
+      const newId = isRental ? 'r' + Date.now() : (tab==='honten'?'h':'s') + Date.now();
+      out = [...out, isRental ? {id:newId, name:addName.trim(), num:addNum.trim()}
+                              : {id:newId, name:addName.trim(), num:addNum.trim(), store:tab}];
+    }
+    return out;
+  };
 
   // 追加
   const addCar = () => {
@@ -6400,9 +6524,9 @@ const LoanerSettingsModal = memo(({isOpen, onClose, listH, listS, onSaveH, onSav
     setAddName(''); setAddNum('');
   };
 
-  // 保存して閉じる
+  // 保存して閉じる（入力途中の変更も含める）
   const handleSave = () => {
-    const clean = items.map(({_key,...c})=>c);
+    const clean = withPending(items).map(({_key,...c})=>c);
     if (tab==='honten')  onSaveH(clean);
     else if (tab==='sanda')   onSaveS(clean);
     else                      onSaveRental(clean);
@@ -6427,7 +6551,7 @@ const LoanerSettingsModal = memo(({isOpen, onClose, listH, listS, onSaveH, onSav
         {/* ヘッダー */}
         <div style={{padding:'18px 22px 10px',borderBottom:'1px solid #e5e7eb',flexShrink:0}}>
           <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:10}}>
-            <h2 style={{margin:0,fontSize:16,fontWeight:800,color:'white'}}>⚙️ 代車・レンタカー設定</h2>
+            <h2 style={{margin:0,fontSize:16,fontWeight:800,color:'#7c2d12'}}>⚙️ 代車・レンタカー設定</h2>
             <button onClick={onClose} style={{background:'#f3f4f6',border:'none',borderRadius:'50%',width:30,height:30,cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center',fontSize:16,color:'#6b7280'}}>×</button>
           </div>
           {/* タブ */}
@@ -6468,11 +6592,11 @@ const LoanerSettingsModal = memo(({isOpen, onClose, listH, listS, onSaveH, onSav
                 /* 編集モード */
                 <>
                   <input value={editName} onChange={e=>setEditName(e.target.value)}
-                    placeholder="車両名" autoFocus
-                    style={{flex:2,padding:'5px 8px',border:'2px solid #6366f1',borderRadius:6,fontSize:12,outline:'none',fontFamily:'inherit'}}/>
+                    placeholder="車両名" autoFocus onKeyDown={e=>{if(e.key==='Enter')saveEdit(i);}}
+                    style={{flex:2,padding:'5px 8px',border:'2px solid #6366f1',borderRadius:6,fontSize:12,outline:'none',fontFamily:'inherit',color:'#111827',background:'white'}}/>
                   <input value={editNum} onChange={e=>setEditNum(e.target.value)}
-                    placeholder="ナンバー"
-                    style={{flex:1,padding:'5px 8px',border:'2px solid #6366f1',borderRadius:6,fontSize:12,outline:'none',fontFamily:'inherit'}}/>
+                    placeholder="ナンバー" onKeyDown={e=>{if(e.key==='Enter')saveEdit(i);}}
+                    style={{flex:1,padding:'5px 8px',border:'2px solid #6366f1',borderRadius:6,fontSize:12,outline:'none',fontFamily:'inherit',color:'#111827',background:'white'}}/>
                   <button onClick={()=>saveEdit(i)}
                     style={{padding:'5px 10px',background:'#c2410c',color:'white',border:'none',borderRadius:6,fontWeight:700,fontSize:11,cursor:'pointer',flexShrink:0}}>✓</button>
                   <button onClick={()=>setEditIdx(null)}
@@ -6482,7 +6606,7 @@ const LoanerSettingsModal = memo(({isOpen, onClose, listH, listS, onSaveH, onSav
                 /* 表示モード */
                 <>
                   <div style={{flex:1,minWidth:0}}>
-                    <div style={{fontWeight:700,fontSize:13,color:'white'}}>{car.name}</div>
+                    <div style={{fontWeight:700,fontSize:13,color:'#111827'}}>{car.name}</div>
                     <div style={{fontSize:10,color:'#9ca3af'}}>{car.num||'—'}</div>
                   </div>
                   <button onClick={()=>startEdit(i)}
@@ -7756,6 +7880,13 @@ function AppInner() {
   // ── 本人認証：この端末に登録された人 ──
   const [authMine,setAuthMine]=useState(()=>hubLive(hubLoadMine()));
   const [showAuthAdd,setShowAuthAdd]=useState(!!HUB_INVITE_ID);   // 招待リンクから開いたら最初から登録画面
+  // 引き継ぎの印（?hand=）つきで開いた：この保管場所に利用証が無ければ印を出して受け取る。
+  // すでにある時は何もしない（URLの印はホーム画面に追加する時のために残す）。
+  const [handPending,setHandPending]=useState(!!HUB_HANDOFF_ID&&hubLive(hubLoadMine()).length===0);
+  useEffect(()=>{
+    if(!handPending)return;
+    (async()=>{ await hubTakeHandoff(); setAuthMine(hubLive(hubLoadMine())); setHandPending(false); })();
+  },[handPending]);
   // 自分でログアウトした直後は、自動ログインを止めてログイン画面を出す。
   // 止めないと押した瞬間に入り直してしまい、交代も「＋スタッフを追加」もできない。
   const [authAutoOff,setAuthAutoOff]=useState(false);
@@ -7932,25 +8063,32 @@ function AppInner() {
     sGet(STOR+'insp-arch').then(v=>{ if(v&&typeof v==='object'&&!Array.isArray(v)) setInspArch(v); }).catch(()=>{});
   },[]);
   // ★起動時の未反映控えの棚卸し（自動再送はしない＝本人が消した予約の復活を防ぐ）。
-  //   サーバーに反映済みなら控えを消す／24時間超の古い控えも消す／それ以外は残して警告のみ。
-  //   保存直後に端末が落ちた等のレアケースを可視化する安全網。日常の再送は保存時の _verify が担う。
+  //   サーバーに反映済みなら控えを消す／24時間超の古い控えも消す／それ以外は画面に出して送り直せるようにする。
+  //   ★2026-09-17 までは残った控えをコンソールに警告するだけで、画面には何も出なかった。
+  //     GASが不調の朝に5件入れて3件が届かず、本人は「保存中」に気づかずリロードして失った。
+  //     確認できなかった控え（サーバーが読めない時）も画面に出す＝GASが戻ってから送り直せる。
+  const [inspPendings,setInspPendings]=useState([]);   // 画面に出す未反映の控え
   useEffect(()=>{
     const pend=inspPendLoad();
     if(!pend.length)return;
     let cancelled=false;
     const run=async()=>{
+      const left=[];
+      let remote=null;
+      try{ remote=await sGet(STOR+'insp'); }catch(e){}
       for(const p of pend){
         if(cancelled)break;
-        try{
-          const remote=await sGet(STOR+'insp');
-          if(!remote||typeof remote!=='object')continue;
+        if(Date.now()-(p.ts||0)>24*3600*1000){inspPendDrop(p.pid);continue;}   // 古すぎる控えは捨てる
+        if(remote&&typeof remote==='object'){
           const rows=remote[p.dk]||[];
           const cust=p.row&&p.row.custId,name=p.row&&p.row.name,no=p.row&&p.row.no;
           const ok=rows.some(r=>r&&r.bookingStatus!=='cancelled'&&(cust?r.custId===cust:(r.name===name&&String(r.no||'')===String(no||''))));
-          if(ok||(Date.now()-(p.ts||0)>24*3600*1000)){inspPendDrop(p.pid);continue;}
-          console.warn('[INSP PEND] 未反映の予約控えが残っています（保存し直しを推奨）:',p.dk,name);
-        }catch(e){}
+          if(ok){inspPendDrop(p.pid);continue;}
+        }
+        left.push(p);
+        console.warn('[INSP PEND] 未反映の予約控えが残っています（送り直しを推奨）:',p.dk,p.row&&p.row.name);
       }
+      if(!cancelled)setInspPendings(left);
     };
     const t=setTimeout(run,4000);
     return()=>{cancelled=true;clearTimeout(t);};
@@ -8128,7 +8266,8 @@ function AppInner() {
     [persistRes,updateLocalRres]);
   const addRentalRes    = useCallback((carId,rec) => persistRres(base=>putResRec(base,carId,String(rec.id),rec),back=>resHasRec(back,carId,rec.id),{verb:'登録',name:rec?.user}),[persistRres]);
   const deleteRentalRes = useCallback((carId,resId) => persistRres(base=>resHasRec(base,carId,resId)?removeResById(base,carId,resId):undefined,back=>!resHasRec(back,carId,resId),{verb:'削除'}),[persistRres]);
-  const replaceRentalRes = useCallback((carId,resId,newRec) => persistRres(base=>resHasRec(base,carId,resId)?patchResRec(base,carId,resId,newRec):undefined,back=>{const r=Object.values(_resObj(back)[carId]||{}).find(x=>x&&x.id===resId);return !!r&&Object.keys(newRec||{}).every(k=>JSON.stringify(r[k])===JSON.stringify(newRec[k]));},{verb:'期間の変更',name:newRec?.user}),[persistRres]);
+  // ★編集は savedAt を打ち直す（古いキャッシュに上書きされないため。sharedRecTs 参照）
+  const replaceRentalRes = useCallback((carId,resId,newRec0) => { const newRec={...(newRec0||{}),savedAt:Date.now()}; return persistRres(base=>resHasRec(base,carId,resId)?patchResRec(base,carId,resId,newRec):undefined,back=>{const r=Object.values(_resObj(back)[carId]||{}).find(x=>x&&x.id===resId);return !!r&&Object.keys(newRec||{}).every(k=>JSON.stringify(r[k])===JSON.stringify(newRec[k]));},{verb:'期間の変更',name:newRec?.user}); },[persistRres]);
   // ★「この端末がたった今登録した代車」を覚えておく。光らせる根拠はこれだけで、
   //   サーバーの応答も保存の完了も待たない＝代車管理を開いた瞬間に必ず光っている。
   //   保存に20秒かかっても、その間に画面を切り替えても、開いた時点から光り始める。
@@ -8223,6 +8362,23 @@ function AppInner() {
   const [restrictionModal, setRestrictionModal] = useState(false); // 入庫制限モーダル
   const [restrTip, setRestrTip] = useState('');                    // 入庫制限バッジのホバー説明（表示中のdk）
   const [inspLimits, setInspLimits] = useShared(STOR+'inspLimits', {}); // 車検台数制限 {dk: number}
+  // 控えの1件を送り直す。サーバー最新値に「まだ無ければ」空き行へ足す（すでに入っていれば何もしない＝二重にならない）。
+  const resendInspPending=useCallback(p=>new Promise(resolve=>{
+    const row=p&&p.row?{...p.row}:null;
+    if(!row||!row.name||!p.dk){resolve(false);return;}
+    const has=obj=>{const rows=(obj&&obj[p.dk])||[];const c=row.custId,nm=row.name,no=row.no;
+      return rows.some(r=>r&&r.bookingStatus!=='cancelled'&&(c?r.custId===c:(r.name===nm&&String(r.no||'')===String(no||''))));};
+    const params={targetDk:p.dk,origDk:p.dk,isDateChange:false,dcPlaceIdx:0,modalIdx:0,row,limits:inspLimits||{},seq:Date.now(),wasEditing:false};
+    persistInsp(base=>has(base)?base:buildInspSave(base,params).result, back=>has(back),
+      {verb:'送り直し',name:row.name,dk:p.dk,pid:p.pid,onDone:ok=>{ if(ok)setInspPendings(l=>l.filter(x=>x.pid!==p.pid)); resolve(ok); }});
+  }),[persistInsp,inspLimits]);
+  const discardInspPending=useCallback(p=>{ inspPendDrop(p.pid); setInspPendings(l=>l.filter(x=>x.pid!==p.pid)); },[]);
+  // ── 保存中の表示。終わるまで画面を閉じたりリロードしたりしないよう促す ──
+  const [saveBusyN,setSaveBusyN]=useState(0);
+  useEffect(()=>{
+    const t=setInterval(()=>{ const n=Number(window.__hubWriteBusy||0); setSaveBusyN(prev=>prev===n?prev:n); },500);
+    return()=>clearInterval(t);
+  },[]);
   // 月間休日数（会社が月ごとに決める「完全休業日＋α」の日数）。{"2026-6":10} の形。
   //   スタッフが自分で数えなくても今月の休日数が分かるようにするための表示専用の数字で、
   //   休業日データや集計には一切影響しない。入力できるのは復旧と同じ4人だけ（canRestore）。
@@ -9809,7 +9965,8 @@ function AppInner() {
 
   // 代車予約の期間編集は1回のatomic更新で差し替える（delete+addの競合を防ぐ）。
   //   bookingKey / carName / carNum / locked などの既存フィールドはそのまま残るので紐付けが切れない。
-  const replaceLoanerRes=useCallback((cid,rid,patch)=>{
+  const replaceLoanerRes=useCallback((cid,rid,patch0)=>{
+    const patch={...(patch0||{}),savedAt:Date.now()};   // ★編集は savedAt を打ち直す（sharedRecTs 参照）
     setLoanerUndo(u=>[...u,{prevState:loanerRes}]);
     persistLres(
       base=>resHasRec(base,cid,rid)?patchResRec(base,cid,rid,patch):undefined,
@@ -9872,7 +10029,7 @@ function AppInner() {
     if(!cur)return;
     const next=!cur.locked;
     persistLres(
-      base=>resHasRec(base,cid,resId)?patchResRec(base,cid,resId,{locked:next}):undefined,
+      base=>resHasRec(base,cid,resId)?patchResRec(base,cid,resId,{locked:next,savedAt:Date.now()}):undefined,   // ★savedAt も打ち直す
       back=>{const r=Object.values(_resObj(back)[cid]||{}).find(x=>x&&x.id===resId);return !r||!!r.locked===next;},
       {verb:'固定の切り替え',name:cur.user}
     );
@@ -10069,6 +10226,13 @@ function AppInner() {
     return()=>{clearInterval(initIv);clearInterval(iv);document.removeEventListener('visibilitychange',onVis);};
   },[currentUser,view,selDate,schedCollapsed]);
 
+  // 引き継ぎ中（?hand=）は、受け取りが済むまで何も描かない（登録画面を一瞬出さない）
+  if(!currentUser&&handPending)return(
+    <>
+      <style>{GCSS}</style>
+      <div style={{position:'fixed',inset:0,background:'linear-gradient(140deg,#1e3a8a,#1d4ed8,#2563eb)',display:'flex',alignItems:'center',justifyContent:'center',color:'white',fontWeight:800,fontSize:15,fontFamily:'system-ui,sans-serif'}}>登録を引き継いでいます…</div>
+    </>
+  );
   // 自動ログインの判定中は、ログイン画面を一瞬でも見せない（開いた瞬間に一瞬出るのを防ぐ）
   if(!currentUser&&_autoPending)return(
     <>
@@ -10080,7 +10244,7 @@ function AppInner() {
   if(!currentUser&&(showAuthAdd||(AUTH_REQUIRED&&authMine.length===0)))return(
     <>
       <style>{GCSS}</style>
-      <AuthAddScreen
+      <AuthAddScreen staffH={staffListH} staffS={staffListS}
         onCancel={(authMine.length>0||!AUTH_REQUIRED)?()=>setShowAuthAdd(false):null}
         onDone={()=>{setShowAuthAdd(false);refreshAuthMine();}}/>
     </>
@@ -10152,6 +10316,46 @@ function AppInner() {
     <div style={{height:'100vh',overflow:'hidden',background:'linear-gradient(140deg,#1e3a8a,#1d4ed8,#2563eb)',fontFamily:'system-ui,-apple-system,sans-serif'}}>
       <style>{GCSS}</style>
 
+      {/* -- 保存中の帯（画面下・中央）。終わるまでリロードしない -- */}
+      {saveBusyN>0&&(
+        <div style={{position:'fixed',left:'50%',bottom:14,transform:'translateX(-50%)',zIndex:1600,background:'#1f2937',color:'white',borderRadius:12,padding:'9px 16px',fontSize:12.5,fontWeight:700,boxShadow:'0 8px 30px rgba(0,0,0,0.35)',display:'flex',alignItems:'center',gap:9,pointerEvents:'none'}}>
+          <span style={{width:10,height:10,borderRadius:'50%',background:'#fbbf24',animation:'hubBlink 1s ease-in-out infinite'}}/>
+          保存中です… 終わるまでこの画面を閉じたり更新したりしないでください
+          <style>{'@keyframes hubBlink{0%,100%{opacity:.25}50%{opacity:1}}'}</style>
+        </div>
+      )}
+      {/* -- 未反映の予約（端末に控えが残っている）。送り直す／破棄 -- */}
+      {inspPendings.length>0&&(
+        <div style={{position:'fixed',right:18,bottom:18,zIndex:1500,width:'min(420px,92vw)',background:'white',border:'2px solid #dc2626',borderRadius:12,boxShadow:'0 12px 40px rgba(0,0,0,0.3)',padding:'12px 14px'}}>
+          <div style={{fontWeight:900,fontSize:13.5,color:'#b91c1c',marginBottom:4}}>⚠️ サーバーに届いていない車検予約が {inspPendings.length} 件あります</div>
+          <div style={{fontSize:11.5,color:'#6b7280',lineHeight:1.6,marginBottom:8}}>
+            保存の途中で画面を閉じた・更新した、またはサーバーが混み合っていた時の控えです。「送り直す」で登録できます（すでに入っていれば二重にはなりません）。
+          </div>
+          <div style={{display:'grid',gap:6,maxHeight:180,overflowY:'auto'}}>
+            {inspPendings.map(p=>{
+              const r=p.row||{};
+              const dk=String(p.dk||'').split('-');
+              const when=dk.length===3?dk[1]+'/'+dk[2]:p.dk;
+              return(
+                <div key={p.pid} style={{display:'flex',alignItems:'center',gap:8,padding:'7px 9px',background:'#fef2f2',border:'1px solid #fecaca',borderRadius:8}}>
+                  <div style={{flex:1,minWidth:0,fontSize:12.5}}>
+                    <b>{when}</b>　{r.name}{r.time?'　'+r.time:''}
+                    <span style={{marginLeft:6,fontSize:11,color:'#6b7280'}}>{r.store==='sanda'?'三田店':'本店'}{r.staff?'・'+r.staff:''}</span>
+                  </div>
+                  <button onClick={()=>resendInspPending(p)} style={{padding:'6px 10px',background:'#dc2626',color:'white',border:'none',borderRadius:7,fontWeight:800,fontSize:11.5,cursor:'pointer',flexShrink:0}}>送り直す</button>
+                  <button onClick={()=>{if(window.confirm('「'+(r.name||'')+'」の控えを破棄しますか？（サーバーには登録されません）'))discardInspPending(p);}}
+                    style={{padding:'6px 8px',background:'#f3f4f6',border:'none',borderRadius:7,fontSize:11.5,cursor:'pointer',flexShrink:0}}>破棄</button>
+                </div>
+              );
+            })}
+          </div>
+          {inspPendings.length>1&&(
+            <button onClick={async()=>{for(const p of [...inspPendings]){await resendInspPending(p);}}}
+              style={{marginTop:8,width:'100%',padding:'8px 0',background:'#b91c1c',color:'white',border:'none',borderRadius:8,fontWeight:800,fontSize:12,cursor:'pointer'}}>すべて送り直す</button>
+          )}
+        </div>
+      )}
+
       {/* -- ヘッダー -- */}
       <header ref={headerRef} style={{background:'linear-gradient(135deg,#1e3a8a,#1d4ed8)',borderBottom:`3px solid ${vsStore.color}`,padding:'9px 18px',position:'fixed',top:0,left:0,right:0,zIndex:500,boxShadow:'0 4px 20px rgba(0,0,0,0.15)'}}>
         {(()=>{
@@ -10186,7 +10390,7 @@ function AppInner() {
                   {isFullscreen?<Shrink size={14}/>:<Expand size={14}/>}{isFullscreen?'元に戻す':'全画面'}
                 </button>
                 <div style={{display:'flex',alignItems:'center',gap:5,padding:'3px 10px',background:userStore.bg,borderRadius:8,border:`2px solid ${userStore.color}33`}}>
-                  <span style={{width:22,height:22,borderRadius:'50%',background:userStore.color,color:'white',display:'flex',alignItems:'center',justifyContent:'center',fontWeight:800,fontSize:11}}>{currentUser?.myNumber??currentUser?.id}</span>
+                  <span style={{width:22,height:22,borderRadius:'50%',background:userStore.color,color:'white',display:'flex',alignItems:'center',justifyContent:'center',fontWeight:800,fontSize:11}}>{String(currentUser?.name||'').charAt(0)}</span>
                   <span style={{fontWeight:700,color:userStore.accent,fontSize:12}}>{currentUser?.name}</span>
                   {currentUser?.badge&&<BadgeIcon badge={currentUser.badge} size={18}/>}
                   {canRestore(currentUser)&&(
@@ -11518,10 +11722,10 @@ const GasDownBanner=()=>{
       boxShadow:'0 2px 12px rgba(0,0,0,.45)',fontFamily:'system-ui,sans-serif'}}>
       <span style={{fontSize:20,lineHeight:1}}>⚠</span>
       <div style={{flex:1,minWidth:240}}>
-        <div style={{fontWeight:900,fontSize:15}}>サーバーに接続できません。データは守られています。</div>
+        <div style={{fontWeight:900,fontSize:15}}>Google のサーバー（保存先）の応答待ちです。データは守られています。（{sec}秒経過）</div>
         <div style={{fontSize:12,opacity:.9,marginTop:2}}>
-          いま画面に出ていない予約も消えていません。繋がり次第このメッセージは消え、自動で表示に戻ります。
-          復旧するまでの入力は保存されないのでお待ちください。（{sec}秒経過）
+          このアプリの故障ではなく、Google 側の処理が混み合っています。いま画面に出ていない予約も消えていません。
+          応答が戻り次第このメッセージは消え、自動で表示に戻ります。それまでの入力は保存されないのでお待ちください。
         </div>
       </div>
       <button onClick={()=>{try{window.__hubGasDown=0;}catch(e){}location.reload();}}
