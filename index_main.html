@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- fixed-holiday-1778028748861 force-deploy-1790153358817 -->
+<!-- fixed-holiday-1778028748861 force-deploy-1790210568585 -->
 <html lang="ja">
 <head>
   <meta charset="UTF-8" />
@@ -22,7 +22,7 @@
     // 開きっぱなしのタブが旧コードのまま動き続けるのを防ぐ。画面復帰時と定期に自分自身を
     // no-store+クエリ付きで取得し、__APP_BUILD が変わっていれば「更新」バナーを表示する。
     // 本番デプロイ時は port_to_main.js が __APP_BUILD を自動更新する（手動更新不要）。
-    window.__APP_BUILD='build-1790153358817';
+    window.__APP_BUILD='build-1790210568586';
     (function(){
       var RUNNING=window.__APP_BUILD, shown=false, checking=false;
       function runningVer(){
@@ -123,7 +123,7 @@
 const { useState, useEffect, useLayoutEffect, useRef, useCallback, memo, useMemo } = React;
 
 // ★ バージョン管理：アップデートのたびにここだけ変更する
-const APP_VERSION = '2.86';
+const APP_VERSION = '2.87';
 // 本人認証を必須にするか。false の間は従来どおり名前を選ぶだけで入れる（移行期間）。
 //   false … 全員が今までどおり使える。端末の登録（＋スタッフを追加）は先にできる。
 //   true  … その端末で本人確認を済ませた人しかログイン画面に出ない。
@@ -3300,6 +3300,9 @@ function mergeSharedObjects(local, server, nowTs){
     const gCar = mg[cid]||{};
     // 値が配列の場合はGAS版をそのまま使う（マージしない）
     if(Array.isArray(lCar)||Array.isArray(gCar))continue;
+    // ★値が「入れ子のオブジェクト」でない時（数値・文字列など）もサーバー値をそのまま使う。
+    //   {...5} は {} になるので、混ぜると台数制限などが空オブジェクトに化ける（2026-09-24 修正）。
+    if(!(lCar&&typeof lCar==='object')||!(gCar&&typeof gCar==='object'))continue;
     const merged = {...gCar};
     for (const day of Object.keys(lCar)) {
       const lRec=lCar[day], gRec=gCar[day];
@@ -9454,6 +9457,10 @@ function AppInner() {
   const [schedCollapsed,setSchedCollapsed]=useState(false); // スケジュール畳む/開く（デフォルト：開く）
   // 全画面表示（ブラウザFullscreen API。タブ・ブックマークバーごと隠れる）
   const [isFullscreen,setIsFullscreen]=useState(false);
+  // ★全画面のお誘い（2026-09-24 ユーザー要望）：開いた直後に一度だけ出す案内。
+  //   以前は画面のどこを触っても全画面に入ったため「意図しない時に全画面になる」状態だった。
+  //   この案内が出ている間のワンクリックだけで入る（案内を消せば、あとはヘッダーの「全画面」ボタンだけ）。
+  const [fsAsk,setFsAsk]=useState(false);
   useEffect(()=>{
     // 全画面状態をsessionStorageに保存し、customers.htmlと相互に引き継ぐ。
     // ページ遷移でブラウザの全画面は強制解除されるため、遷移先で最初のクリック時に自動復帰させる
@@ -9471,12 +9478,8 @@ function AppInner() {
     document.addEventListener('fullscreenchange',h);
     document.addEventListener('webkitfullscreenchange',h);
     window.addEventListener('pagehide',onHide);
-    // 全画面はページ遷移で必ず解除される。ブラウザ仕様上、遷移先で自動復帰はできず「ユーザー操作」が要る。
-    // そこで最初の操作すべて（クリック・タッチ・スクロール・キー）で復帰させ、実質ワンアクションで全画面に戻す。
-    let restore=null;
-    // 待ち受ける操作。ブラウザが「ユーザー操作」と認めるものは環境で違う（タッチでは pointerdown が
-    //   認められず touchend/click だけの場合がある）ので広めに取り、失敗したら次の操作でまた試す。
-    const RESTORE_EVENTS=['pointerdown','mousedown','pointerup','touchstart','touchend','click','keydown','wheel'];
+    // 全画面はページ遷移で必ず解除される。ブラウザ仕様上、JS だけでは戻せず「ユーザー操作」が要る。
+    // そこで開いた直後に案内（fsAsk）を出し、そのワンクリックで全画面に入る。
     // ★既定は全画面（ユーザー指示・2026-09-12）。「元に戻す」を押して全画面をやめた記録
     //   （localStorage fs-pref='off'）が無ければ、次の操作（クリック・タッチ・キー・スクロール）で全画面に入る。
     //   判定は fs-pref だけ。sessionStorage の fs-restore は見ない（Esc や閉じる時にも '0' が書かれ、
@@ -9487,30 +9490,32 @@ function AppInner() {
     //   一度「元に戻す」を押した端末は二度と自動で入らなかった）。古い記憶は消しておく。
     try{ localStorage.removeItem(STOR+'fs-pref2'); }catch(e){}
     const fsWanted=()=>{ try{ return (sessionStorage.getItem(STOR+'fs-pref2')||'on')!=='off'; }catch(e){ return true; } };
-    const arm=()=>{
-      if(restore)return;
-      if(document.fullscreenElement||document.webkitFullscreenElement)return;
-      if(!fsWanted())return;
-      restore=(ev)=>{
-        // 「全画面／元に戻す」ボタン上の操作はボタン自身に任せる。ここで先に全画面へ入れてしまうと、
-        //   直後の click がボタンを「元に戻す」と解釈して外し、fs-pref まで 'off' にしていた。
-        try{ if(ev&&ev.target&&ev.target.closest&&ev.target.closest('[data-fs-toggle]'))return; }catch(e){}
-        const el=document.documentElement;
-        const req=el.requestFullscreen||el.webkitRequestFullscreen;
-        if(!req)return;
-        RESTORE_EVENTS.forEach(ev2=>document.removeEventListener(ev2,restore,true));restore=null;
-        // スクロールや Esc は「ユーザー操作」と認められず失敗する。その時は待ち受けを付け直して次の操作で試す。
-        Promise.resolve(req.call(el)).catch(()=>{ setTimeout(arm,0); });
-      };
-      RESTORE_EVENTS.forEach(ev=>document.addEventListener(ev,restore,true));
-    };
-    try{ arm(); }catch(e){}
+    const canFs=!!(document.documentElement.requestFullscreen||document.documentElement.webkitRequestFullscreen);
+    let askTimer=null;
+    if(canFs&&fsWanted()&&!(document.fullscreenElement||document.webkitFullscreenElement)){
+      setFsAsk(true);
+      askTimer=setTimeout(()=>setFsAsk(false),10000);   // 10秒さわらなければ自然に消える（画面を塞ぎ続けない）
+    }
     return()=>{
+      if(askTimer)clearTimeout(askTimer);
       document.removeEventListener('fullscreenchange',h);
       document.removeEventListener('webkitfullscreenchange',h);
       window.removeEventListener('pagehide',onHide);
-      if(restore)RESTORE_EVENTS.forEach(ev=>document.removeEventListener(ev,restore,true));
     };
+  },[]);
+  // 案内からワンクリックで全画面に入る。文字が青く選ばれないよう、押した時の選択は止める。
+  const fsAskGo=useCallback(()=>{
+    setFsAsk(false);
+    try{
+      try{sessionStorage.setItem(STOR+'fs-pref2','on');}catch(e){}
+      const el=document.documentElement;
+      const req=el.requestFullscreen||el.webkitRequestFullscreen;
+      if(req)Promise.resolve(req.call(el)).catch(()=>{});
+    }catch(e){}
+  },[]);
+  const fsAskNo=useCallback(()=>{
+    setFsAsk(false);
+    try{sessionStorage.setItem(STOR+'fs-pref2','off');}catch(e){}   // このタブではもう聞かない（ヘッダーのボタンでいつでも入れる）
   },[]);
   const toggleFullscreen=useCallback(()=>{
     try{
@@ -11828,6 +11833,30 @@ function AppInner() {
   return (
     <div style={{height:'100vh',overflow:'hidden',background:'linear-gradient(140deg,#1e3a8a,#1d4ed8,#2563eb)',fontFamily:'system-ui,-apple-system,sans-serif'}}>
       <style>{GCSS}</style>
+
+      {/* -- 全画面のお誘い（2026-09-24）。開いた直後に一度だけ。ここをワンクリックで全画面に入る -- */}
+      {fsAsk&&!isFullscreen&&(
+        <div onMouseDown={e=>e.preventDefault()} onClick={fsAskGo}
+          style={{position:'fixed',inset:0,zIndex:2147482000,background:'rgba(15,23,42,.55)',display:'flex',alignItems:'center',justifyContent:'center',
+            cursor:'pointer',userSelect:'none',WebkitUserSelect:'none'}}>
+          <div style={{background:'white',borderRadius:16,padding:'22px 26px',textAlign:'center',boxShadow:'0 24px 70px rgba(0,0,0,.45)',maxWidth:420,userSelect:'none',WebkitUserSelect:'none'}}>
+            <div style={{fontSize:34,marginBottom:6}}>🖥</div>
+            <div style={{fontWeight:900,fontSize:17,color:'#0f172a'}}>全画面で使いますか？</div>
+            <div style={{fontSize:12.5,color:'#475569',lineHeight:1.8,marginTop:6}}>
+              画面のどこでもクリックすると全画面になります。<br/>
+              全画面をやめる時は、右上の「元に戻す」か Esc キーです。
+            </div>
+            <button onMouseDown={e=>e.preventDefault()} onClick={fsAskGo}
+              style={{marginTop:14,width:'100%',padding:'12px 0',background:'linear-gradient(135deg,#c2410c,#f97316)',color:'white',border:'none',borderRadius:11,fontWeight:900,fontSize:15,cursor:'pointer'}}>
+              全画面にする
+            </button>
+            <button onMouseDown={e=>e.preventDefault()} onClick={e=>{e.stopPropagation();fsAskNo();}}
+              style={{marginTop:8,width:'100%',padding:'9px 0',background:'#f8fafc',color:'#475569',border:'2px solid #cbd5e1',borderRadius:10,fontWeight:700,fontSize:13,cursor:'pointer'}}>
+              このまま使う（全画面にしない）
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* -- 保存中の帯（画面下・中央）。終わるまでリロードしない -- */}
       {saveBusyN>0&&(
